@@ -3,7 +3,7 @@
 """
 source_calibration.py — Calibração da intensidade da fonte para reproduzir fluxo experimental.
 
-Módulo V242 — IMPLEMENTAÇÃO CORRIGIDA COM get_values() DIRETO
+Módulo V245 — CORREÇÕES OPENMC 0.15.3: CellFilter com IDs e get_values() robusto
 
 CONTRATO FÍSICO:
   Quando FLUXO + espectro são fornecidos no input, o simulador executa uma
@@ -22,6 +22,13 @@ ALGORITMO:
 RESULTADO:
   source_rate calibrado que reproduz o FLUXO experimental dentro da tolerância.
   Este valor é congelado e usado em toda a depleção subsequente.
+  
+FIXES V245 (OPENMC 0.15.3):
+  - CellFilter agora usa IDs inteiros, não objetos cell (compatibilidade OpenMC 0.15.3)
+  - get_values() convertido explicitamente com np.asarray().ravel() para garantir array 1D
+  - Log detalhado do tipo/valor RAW retornado por get_values() para debug
+  - Log de exceções completas com stack trace (exc_info=True)
+  - Extração explícita de cell.id antes de criar CellFilter
   
 FIXES V242:
   - EXTRAÇÃO DIRETA via tally.get_values() como fallback quando pandas falha
@@ -423,68 +430,66 @@ class SourceCalibrator:
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     return 0.0, 0.0, 0.0
 
-                df = tally.get_pandas_dataframe()
-
-                # FIX BUG RAIZ V242: Extração robusta de fluxo usando get_values() direto
-                # Em OpenMC ≥ 0.15, get_pandas_dataframe() pode retornar Series com dtype=object
-                # contendo arrays numpy, causando erro "setting an array element with a sequence".
-                # SOLUÇÃO: Usar tally.get_values() que retorna array numpy limpo.
+                # FIX BUG RAIZ V244: NUNCA usar get_pandas_dataframe() para tallies de fluxo
+                # O erro "setting an array element with a sequence" ocorre DENTRO do pandas
+                # ao tentar converter Series com arrays numpy aninhados (dtype=object).
+                # SOLUÇÃO DEFINITIVA: Usar APENAS tally.get_values() que retorna array limpo.
                 
-                def _safe_extract_flux(series) -> float:
-                    """Extrai valor de fluxo de série pandas, lidando com arrays aninhados."""
-                    try:
-                        total = 0.0
-                        for v in series:
-                            arr = np.asarray(v, dtype=float).ravel()
-                            total += float(arr.sum())
-                        return total
-                    except Exception as exc_inner:
-                        try:
-                            return float(series.apply(lambda x: float(np.asarray(x, dtype=float).sum())).sum())
-                        except Exception:
-                            logger.warning(
-                                "_safe_extract_flux (pandas) falhou: %s. Tentando get_values().",
-                                exc_inner
-                            )
-                            return 0.0
-
-                # TENTATIVA 1: via pandas DataFrame
-                mean_flux_per_particle = _safe_extract_flux(df["mean"])
+                logger.debug("Extraindo fluxo via tally.get_values() (sem pandas)...")
+                logger.debug("Tally info: name=%s, scores=%s, filters=%s", 
+                    tally.name, tally.scores, 
+                    [type(f).__name__ for f in tally.filters] if hasattr(tally, 'filters') else 'N/A'
+                )
                 
-                # TENTATIVA 2: se falhou, usar get_values() direto do tally
-                if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle):
-                    logger.info("Tentando extração via tally.get_values()...")
-                    try:
-                        flux_values = tally.get_values(value='mean')
-                        if flux_values is not None and len(flux_values) > 0:
-                            mean_flux_per_particle = float(np.sum(flux_values))
-                            logger.info(
-                                "get_values() sucesso: flux=%.4e shape=%s dtype=%s",
-                                mean_flux_per_particle, flux_values.shape, flux_values.dtype
-                            )
-                        else:
-                            logger.warning("get_values() retornou None ou array vazio")
-                    except Exception as exc_gv:
-                        logger.error("get_values() falhou: %s", exc_gv)
+                mean_flux_per_particle = 0.0
+                std_flux = 0.0
                 
-                # Validação explícita: fluxo de tally de fluxo deve ser escalar positivo
+                try:
+                    # Extrai valor médio direto como array numpy
+                    flux_values = tally.get_values(value='mean')
+                    logger.debug(
+                        "RAW flux_values: type=%s, value=%s",
+                        type(flux_values), repr(flux_values)
+                    )
+                    if flux_values is not None:
+                        # FIX V245: Converter para numpy array explicitamente e achatar
+                        flux_array = np.asarray(flux_values, dtype=float).ravel()
+                        logger.debug(
+                            "flux_array: shape=%s, dtype=%s, sum=%.4e",
+                            flux_array.shape, flux_array.dtype, flux_array.sum()
+                        )
+                        mean_flux_per_particle = float(flux_array.sum())
+                        logger.info(
+                            "get_values(mean) sucesso: flux=%.4e (achatar: shape=%s dtype=%s)",
+                            mean_flux_per_particle, flux_array.shape, flux_array.dtype
+                        )
+                    else:
+                        logger.error("get_values(mean) retornou None")
+                        mean_flux_per_particle = 0.0
+                except Exception as exc_mean:
+                    logger.error("get_values(mean) falhou com exceção: %s", exc_mean, exc_info=True)
+                    mean_flux_per_particle = 0.0
+                
+                # Extrai desvio padrão
+                try:
+                    std_values = tally.get_values(value='std_dev')
+                    if std_values is not None and std_values.size > 0:
+                        std_flux = float(np.sum(std_values))
+                        logger.debug("get_values(std_dev): %.4e", std_flux)
+                    else:
+                        std_flux = 0.0
+                except Exception as exc_std:
+                    logger.warning("get_values(std_dev) falhou: %s", exc_std)
+                    std_flux = 0.0
+                
+                # Validação explícita: fluxo deve ser escalar positivo
                 if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle):
                     logger.error(
-                        "Fluxo extraído inválido: %.4e (tally=%s, scores=%s, filters=%s)",
-                        mean_flux_per_particle, tally.name,
-                        tally.scores,
-                        [type(f).__name__ for f in tally.filters] if hasattr(tally, 'filters') else 'N/A'
+                        "Fluxo extraído inválido: %.4e (tally=%s, scores=%s)",
+                        mean_flux_per_particle, tally.name, tally.scores,
                     )
-                    logger.error("DataFrame info: shape=%s, columns=%s, dtypes=%s",
-                        getattr(df, 'shape', 'N/A'),
-                        list(df.columns) if hasattr(df, 'columns') else 'N/A',
-                        {col: str(df[col].dtype) for col in df.columns} if hasattr(df, 'columns') and hasattr(df, 'dtypes') else 'N/A'
-                    )
-                    logger.error("Primeiras linhas do DataFrame:\n%s", df.head(10).to_string() if hasattr(df, 'head') else str(df)[:500])
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     return 0.0, 0.0, 0.0
-                
-                std_flux = _safe_extract_flux(df["std. dev."]) if "std. dev." in df.columns else 0.0
 
                 vol_region = self._get_calibration_volume(tally, sp)
                 
@@ -724,14 +729,20 @@ class SourceCalibrator:
         if first_layer_cell is None:
             raise ValueError("Nenhuma camada do alvo encontrada em cellsdict")
         
+        # FIX V245: Extrair ID da célula explicitamente
+        # OpenMC 0.15.3 CellFilter pode exigir IDs (int) em vez de objetos cell
+        cell_id = first_layer_cell.id if hasattr(first_layer_cell, 'id') else int(first_layer_cell)
+        
         logger.info(
-            "Região de calibração: '%s' (id=%d)",
+            "Região de calibração: '%s' (id=%d, type=%s)",
             first_layer_name,
-            first_layer_cell.id if hasattr(first_layer_cell, 'id') else '?',
+            cell_id,
+            type(first_layer_cell).__name__
         )
         
         # Tally de fluxo na primeira camada
-        cell_filter = openmc.CellFilter([first_layer_cell])
+        # FIX V245: Passar ID como inteiro, não objeto cell
+        cell_filter = openmc.CellFilter([cell_id])
         
         tally = openmc.Tally(name=self.config.CALIBRATION_TALLY_NAME)
         tally.filters = [cell_filter]
