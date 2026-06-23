@@ -3,7 +3,7 @@
 """
 source_calibration.py — Calibração da intensidade da fonte para reproduzir fluxo experimental.
 
-Módulo V241 — IMPLEMENTAÇÃO CORRIGIDA PARA PRODUÇÃO
+Módulo V242 — IMPLEMENTAÇÃO CORRIGIDA COM get_values() DIRETO
 
 CONTRATO FÍSICO:
   Quando FLUXO + espectro são fornecidos no input, o simulador executa uma
@@ -23,10 +23,15 @@ RESULTADO:
   source_rate calibrado que reproduz o FLUXO experimental dentro da tolerância.
   Este valor é congelado e usado em toda a depleção subsequente.
   
+FIXES V242:
+  - EXTRAÇÃO DIRETA via tally.get_values() como fallback quando pandas falha
+  - get_values() retorna array numpy limpo, evitando erro "setting an array element"
+  - Log detalhado de shape/dtype do array retornado por get_values()
+  - Mensagens de erro melhoradas com scores e filters do tally
+  
 FIXES V241:
   - Extração robusta de fluxo do tally pandas DataFrame para arrays aninhados
-  - Implementação _safe_extract_flux usando np.asarray().ravel() para evitar
-    erro "setting an array element with a sequence" do numpy
+  - Implementação _safe_extract_flux usando np.asarray().ravel()
   - Log detalhado de dtypes do DataFrame para debug
   - Validação explícita de fluxo > 0 antes de prosseguir
   
@@ -133,7 +138,7 @@ class SourceCalibrator:
       - Usa chaves do contrato atual (cellsdict, water_front, etc.)
     """
     
-    VERSION = "V241"
+    VERSION = "V243"
     
     def __init__(
         self,
@@ -420,43 +425,62 @@ class SourceCalibrator:
 
                 df = tally.get_pandas_dataframe()
 
-                # FIX BUG RAIZ V241: Extração robusta de fluxo do tally pandas DataFrame
-                # Em OpenMC ≥ 0.15 com CellFilter + score='flux', df['mean'] pode ser
-                # uma Series de arrays numpy (dtype=object), não de escalares.
-                # O erro 'setting an array element with a sequence' ocorre quando
-                # tentamos converter diretamente sem tratar arrays aninhados.
+                # FIX BUG RAIZ V242: Extração robusta de fluxo usando get_values() direto
+                # Em OpenMC ≥ 0.15, get_pandas_dataframe() pode retornar Series com dtype=object
+                # contendo arrays numpy, causando erro "setting an array element with a sequence".
+                # SOLUÇÃO: Usar tally.get_values() que retorna array numpy limpo.
+                
                 def _safe_extract_flux(series) -> float:
                     """Extrai valor de fluxo de série pandas, lidando com arrays aninhados."""
                     try:
                         total = 0.0
                         for v in series:
-                            # Converte cada elemento para array numpy e soma
                             arr = np.asarray(v, dtype=float).ravel()
                             total += float(arr.sum())
                         return total
                     except Exception as exc_inner:
-                        # Fallback: tenta aplicar sum elemento a elemento
                         try:
                             return float(series.apply(lambda x: float(np.asarray(x, dtype=float).sum())).sum())
                         except Exception:
                             logger.warning(
-                                "_safe_extract_flux falhou em ambos os métodos: %s. "
-                                "Retornando 0.0 para forçar re-tentativa ou fallback.",
+                                "_safe_extract_flux (pandas) falhou: %s. Tentando get_values().",
                                 exc_inner
                             )
                             return 0.0
 
+                # TENTATIVA 1: via pandas DataFrame
                 mean_flux_per_particle = _safe_extract_flux(df["mean"])
+                
+                # TENTATIVA 2: se falhou, usar get_values() direto do tally
+                if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle):
+                    logger.info("Tentando extração via tally.get_values()...")
+                    try:
+                        flux_values = tally.get_values(value='mean')
+                        if flux_values is not None and len(flux_values) > 0:
+                            mean_flux_per_particle = float(np.sum(flux_values))
+                            logger.info(
+                                "get_values() sucesso: flux=%.4e shape=%s dtype=%s",
+                                mean_flux_per_particle, flux_values.shape, flux_values.dtype
+                            )
+                        else:
+                            logger.warning("get_values() retornou None ou array vazio")
+                    except Exception as exc_gv:
+                        logger.error("get_values() falhou: %s", exc_gv)
                 
                 # Validação explícita: fluxo de tally de fluxo deve ser escalar positivo
                 if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle):
                     logger.error(
-                        "Fluxo extraído inválido: %.4e (tally=%s, df_shape=%s, df_columns=%s, df_dtypes=%s)",
-                        mean_flux_per_particle, tally.name, 
-                        getattr(df, 'shape', 'N/A'), 
+                        "Fluxo extraído inválido: %.4e (tally=%s, scores=%s, filters=%s)",
+                        mean_flux_per_particle, tally.name,
+                        tally.scores,
+                        [type(f).__name__ for f in tally.filters] if hasattr(tally, 'filters') else 'N/A'
+                    )
+                    logger.error("DataFrame info: shape=%s, columns=%s, dtypes=%s",
+                        getattr(df, 'shape', 'N/A'),
                         list(df.columns) if hasattr(df, 'columns') else 'N/A',
                         {col: str(df[col].dtype) for col in df.columns} if hasattr(df, 'columns') and hasattr(df, 'dtypes') else 'N/A'
                     )
+                    logger.error("Primeiras linhas do DataFrame:\n%s", df.head(10).to_string() if hasattr(df, 'head') else str(df)[:500])
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     return 0.0, 0.0, 0.0
                 
@@ -582,7 +606,49 @@ class SourceCalibrator:
         return settings
     
     def _build_energy_distribution(self) -> "openmc.stats.Univariate":
-        """Constrói distribuição energética da fonte a partir do espectro."""
+        """Constrói distribuição energética da fonte a partir do espectro.
+        
+        FIX V243 — BUG FÍSICO CRÍTICO:
+          O parser retorna espectro TABULAR com estrutura:
+            {"type": "tabular", "data": {"energies_ev": [...], "probabilities": [...]}}
+          Este método agora acessa corretamente os dados aninhados em 'data'.
+        """
+        # CASO 1: Parser retornou espectro TABULAR direto (ORIGEN252, etc.)
+        # Estrutura: {"type": "tabular", "data": {"energies_ev": [...], "probabilities": [...]}}
+        if self.energy_source.get("type") == "tabular":
+            data = self.energy_source.get("data", {})
+            energies = data.get("energies_ev") or data.get("parsed_data", {}).get("energies_ev")
+            probs = data.get("probabilities") or data.get("parsed_data", {}).get("probabilities")
+            if energies and probs and len(energies) == len(probs):
+                logger.info(
+                    "Usando espectro tabular ORIGEN252: %d pontos, source=%s, weights=%s",
+                    len(energies),
+                    data.get("source", self.energy_source.get("source", "desconhecida")),
+                    data.get("weights", "N/A")
+                )
+                return openmc.stats.Tabular(
+                    [float(e) for e in energies],
+                    [float(p) for p in probs],
+                    interpolation="histogram"
+                )
+        
+        # CASO 2: Estrutura antiga com 'energies_ev' direto no root (compatibilidade)
+        if "energies_ev" in self.energy_source and "probabilities" in self.energy_source:
+            energies = self.energy_source["energies_ev"]
+            probs = self.energy_source["probabilities"]
+            if energies and probs and len(energies) == len(probs):
+                logger.info(
+                    "Usando espectro tabular direto (legacy): %d pontos, origem=%s",
+                    len(energies),
+                    self.energy_source.get("source", "desconhecida"),
+                )
+                return openmc.stats.Tabular(
+                    [float(e) for e in energies],
+                    [float(p) for p in probs],
+                    interpolation="histogram"
+                )
+        
+        # CASO 3: Estrutura aninhada (tipo antigo com 'type' e 'data')
         stype = self.energy_source.get("type", "maxwell")
         data = self.energy_source.get("data", {})
         kb_eV = PhysicsConstants.KB_EV
@@ -620,6 +686,7 @@ class SourceCalibrator:
                 return openmc.stats.Tabular(energies, probs)
         
         # Fallback: Maxwell com temperatura padrão
+        logger.warning("Espectro não reconhecido, usando Maxwell fallback")
         return openmc.stats.Maxwell(300.0 * kb_eV)
     
     def _build_calibration_tallies(self) -> openmc.Tallies:
