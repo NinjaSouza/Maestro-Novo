@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tallies.py V305 — Tallies OpenMC para deposição de energia e fluxo.
+tallies.py V306 — Tallies OpenMC para deposição de energia e fluxo.
 
 Física:
-    heating      [eV/src]: deposição total de energia kerma por nêutron-fonte.
-    kappa-fission[eV/src]: energia de fissão (fragmentos+prompt n+prompt γ).
-    flux         [n·cm/src]: fluxo integrado por célula.
-    fission_rate [rx/src]: taxa de fissão.
+    heating          [eV/src]: deposição total de energia kerma por nêutron-fonte.
+    energy-deposition[eV/src]: deposição de energia local (fallback para heating).
+    kappa-fission    [eV/src]: energia de fissão (fragmentos+prompt n+prompt γ).
+    flux             [n·cm/src]: fluxo integrado por célula.
+    fission_rate     [rx/src]: taxa de fissão.
 
     P [W] = score [eV/src] × source_rate [n/s] × BRIDGE.EV_TO_J
+
+CHANGELOG V306 vs V305:
+  FIX V250 — Adicionado tally 'energy-deposition' como fallback para quando
+             'heating' retorna zero (comum em ENDF/B-VIII.0 com dados incompletos).
+             Também adicionado logging detalhado no simulation.py para diagnosticar
+             potência zero mesmo com fissões ocorrendo.
 
 CHANGELOG V305 vs V304:
   FIX V247 — Compatibilidade OpenMC 0.15.3: _cells_to_filter agora extrai IDs
@@ -165,8 +172,12 @@ def _extract_scores_from_df(
 
 def create_heating_tallies(geometry_result: dict) -> "openmc.Tallies":
     """
-    Cria tallies de heating, flux, fission_rate, kappa-fission e flux_spectrum.
-
+    Cria tallies de heating, energy-deposition, flux, fission_rate, kappa-fission e flux_spectrum.
+    
+    FIX V250: Adicionado tally 'energy-deposition' como fallback para quando
+    'heating' falha em retornar valores não-nulos (comum em bibliotecas ENDF/B-VIII.0
+    onde dados de heating podem estar incompletos para alguns materiais).
+    
     O tally 'flux_spectrum' adiciona filtro de energia de 10 grupos log-uniformes
     (1e-5 eV – 20 MeV) por célula, permitindo verificar a composição espectral
     e calcular yields de fissão ponderados pelo espectro real (ver
@@ -176,7 +187,7 @@ def create_heating_tallies(geometry_result: dict) -> "openmc.Tallies":
         geometry_result: Dict com 'cells_dict': {cell_name: openmc.Cell}.
 
     Returns:
-        openmc.Tallies com 5 tallies nomeados.
+        openmc.Tallies com 6 tallies nomeados.
     """
     cells_dict = geometry_result.get("cells_dict", {})
     if not cells_dict:
@@ -189,10 +200,11 @@ def create_heating_tallies(geometry_result: dict) -> "openmc.Tallies":
 
     # Tallies padrão (sem filtro de energia)
     for tname, score in (
-        ("heating",       "heating"),
-        ("flux",          "flux"),
-        ("fission_rate",  "fission"),
-        ("kappa-fission", "kappa-fission"),
+        ("heating",          "heating"),
+        ("energy-deposition","energy-deposition"),  # FIX V250: fallback para heating
+        ("flux",             "flux"),
+        ("fission_rate",     "fission"),
+        ("kappa-fission",    "kappa-fission"),
     ):
         t = openmc.Tally(name=tname)
         t.filters = [cell_filter]
@@ -206,7 +218,7 @@ def create_heating_tallies(geometry_result: dict) -> "openmc.Tallies":
     tallies.append(t_spec)
 
     logger.info(
-        "create_heating_tallies: %d tallies criados (%d grupos espectrais)",
+        "create_heating_tallies: %d tallies criados (%d grupos espectrais, inclui energy-deposition)",
         len(tallies), _N_ENERGY_GROUPS,
     )
     return tallies

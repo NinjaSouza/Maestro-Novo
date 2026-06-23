@@ -3,9 +3,25 @@
 """
 source_calibration.py — Calibração da intensidade da fonte para reproduzir fluxo experimental.
 
-Módulo V247 — CORREÇÃO OPENMC 0.15.3: tratamento robusto de filt.bins que pode retornar
-  tuplas (cell_id, weight) ou IDs diretos. Adicionado logging detalhado para debug de
-  volume zero/NaN na calibração.
+Módulo V249 — FIX DEFINITIVO OpenMC 0.15.3: Extração robusta de flux_values
+  Corrige erro "setting an array element with a sequence" ao extrair valores do tally.
+  
+  FIX V249:
+    - Detecção explícita de dtype=object em flux_values
+    - Iteração sobre elementos aninhados (list/tuple/ndarray) dentro do array
+    - Extração recursiva de valores escalares antes de converter para float
+    - Logging detalhado do processo de extração (shape/dtype antes/depois)
+  
+  ADIÇÕES V248 (mantidas):
+    - Log completo de todos os tallies no statepoint ao carregar
+    - Diagnóstico detalhado do erro numpy com possíveis causas
+    - Logging aprimorado em _get_calibration_volume com fallback via geometry_result
+    - Rastreamento de cell_ids extraídos de CellFilter.bins
+  
+FIXES V247 (OPENMC 0.15.3):
+  - _get_calibration_volume() trata filt.bins retornando tuplas (cell_id, weight)
+  - Logging detalhado de volumes por célula para debug de volume zero
+  - Validação explícita de volume > 0 antes de retornar
 
 CONTRATO FÍSICO:
   Quando FLUXO + espectro são fornecidos no input, o simulador executa uma
@@ -157,7 +173,7 @@ class SourceCalibrator:
       - Usa chaves do contrato atual (cellsdict, water_front, etc.)
     """
     
-    VERSION = "V247"
+    VERSION = "V249"
     
     def __init__(
         self,
@@ -430,7 +446,24 @@ class SourceCalibrator:
 
         try:
             with openmc.StatePoint(str(sp_path)) as sp:
+                # DEBUG V248: Log completo do statepoint
+                logger.info("StatePoint carregado: %s", sp_path)
+                logger.debug("StatePoint attributes: n_realizations=%s, n_inactive=%s", 
+                            getattr(sp, 'n_realizations', 'N/A'), 
+                            getattr(sp, 'n_inactive', 'N/A'))
+                
+                # Listar todos os tallies disponíveis
+                if hasattr(sp, 'tallies') and sp.tallies:
+                    logger.debug("Tallies disponíveis no statepoint:")
+                    for tid, t in sp.tallies.items():
+                        logger.debug("  Tally ID=%d: name='%s', scores=%s, filters=%s",
+                                    tid, getattr(t, 'name', 'N/A'), 
+                                    getattr(t, 'scores', 'N/A'),
+                                    [type(f).__name__ for f in getattr(t, 'filters', [])])
+                
                 tally = sp.get_tally(name=self.config.CALIBRATION_TALLY_NAME)
+                logger.info("Tally de calibração encontrado: ID=%d, name='%s', scores=%s",
+                           getattr(tally, 'id', 'N/A'), tally.name, tally.scores)
 
                 # Validar que é o tally correto (score 'flux', não reaction rates)
                 if "flux" not in tally.scores:
@@ -464,15 +497,37 @@ class SourceCalibrator:
                         type(flux_values), repr(flux_values)
                     )
                     if flux_values is not None:
-                        # FIX V245: Converter para numpy array explicitamente e achatar
-                        flux_array = np.asarray(flux_values, dtype=float).ravel()
+                        # FIX V249: Extração robusta para OpenMC 0.15.3
+                        # O get_values pode retornar array com dtype=object contendo arrays aninhados
+                        flux_array = np.asarray(flux_values)
                         logger.debug(
-                            "flux_array: shape=%s, dtype=%s, sum=%.4e",
+                            "flux_array inicial: shape=%s, dtype=%s",
+                            flux_array.shape, flux_array.dtype
+                        )
+                        
+                        # Se for dtype=object, extrai valores escalares de cada elemento
+                        if flux_array.dtype == object:
+                            flat_values = []
+                            for item in flux_array.flat:
+                                if isinstance(item, (list, tuple, np.ndarray)):
+                                    flat_values.extend(np.asarray(item, dtype=float).ravel())
+                                else:
+                                    flat_values.append(float(item))
+                            flux_array = np.array(flat_values, dtype=float)
+                            logger.debug(
+                                "flux_array após extração: shape=%s, dtype=%s, sum=%.4e",
+                                flux_array.shape, flux_array.dtype, flux_array.sum()
+                            )
+                        else:
+                            flux_array = flux_array.astype(float).ravel()
+                        
+                        logger.debug(
+                            "flux_array final: shape=%s, dtype=%s, sum=%.4e",
                             flux_array.shape, flux_array.dtype, flux_array.sum()
                         )
                         mean_flux_per_particle = float(flux_array.sum())
                         logger.info(
-                            "get_values(mean) sucesso: flux=%.4e (achatar: shape=%s dtype=%s)",
+                            "get_values(mean) sucesso: flux=%.4e (shape=%s dtype=%s)",
                             mean_flux_per_particle, flux_array.shape, flux_array.dtype
                         )
                     else:
@@ -480,6 +535,17 @@ class SourceCalibrator:
                         mean_flux_per_particle = 0.0
                 except Exception as exc_mean:
                     logger.error("get_values(mean) falhou com exceção: %s", exc_mean, exc_info=True)
+                    # DIAGNÓSTICO V248: Tentar extrair informação do erro
+                    if "setting an array element" in str(exc_mean):
+                        logger.critical(
+                            "ERRO CRÍTICO: O erro 'setting an array element with a sequence' indica que "
+                            "o tally.get_values() está retornando uma estrutura de dados incompatível. "
+                            "Isso pode ser causado por:\n"
+                            "  1. Statepoint errado (de depleção em vez de calibração)\n"
+                            "  2. Tally com múltiplos scores/filters criando array multidimensional\n"
+                            "  3. Bug de compatibilidade OpenMC 0.15.3\n"
+                            "Verifique os logs acima para ver quais tallies estão no statepoint."
+                        )
                     mean_flux_per_particle = 0.0
                 
                 # Extrai desvio padrão
@@ -545,18 +611,24 @@ class SourceCalibrator:
         """
         Obtém volume da região de calibração a partir do tally ou geometria.
         
-        FIX V247: Compatibilidade total com OpenMC 0.15.3
-          - filt.bins em OpenMC 0.15.3 retorna lista de tuplas (cell_id, weight) ou apenas IDs
-          - Adicionado tratamento robusto para extrair cell_ids corretamente
+        FIX V248: Melhoria no diagnóstico de volume zero
+          - Log detalhado do summary e geometry
+          - Tentativa alternativa de obter volume via geometry_result
         """
+        logger.debug("_get_calibration_volume: iniciando busca de volume")
+        logger.debug("  sp.summary exists: %s", hasattr(sp, 'summary') and sp.summary is not None)
+        
         # Tenta obter volume dos filtros do tally
         for filt in tally.filters:
             if isinstance(filt, openmc.CellFilter):
+                logger.debug("  CellFilter encontrado: filters=%s", getattr(filt, '_bins', 'N/A'))
+                
                 # FIX V247: Em OpenMC 0.15.3, filt.bins pode retornar:
                 #   - Lista de IDs: [1, 2, 3]
                 #   - Lista de tuplas: [(1, 1.0), (2, 1.0)]
                 # Precisamos extrair apenas os IDs
                 bins_data = getattr(filt, 'bins', getattr(filt, 'cells', []))
+                logger.debug("  bins_data raw: %s (type=%s)", bins_data, type(bins_data))
                 
                 # Extrai cell_ids tratando diferentes formatos
                 cell_ids = []
@@ -564,38 +636,71 @@ class SourceCalibrator:
                     if isinstance(item, tuple):
                         # Formato (cell_id, weight)
                         cell_ids.append(item[0])
+                        logger.debug("    Extraído cell_id=%d de tuple (id, weight)", item[0])
                     elif isinstance(item, (int, np.integer)):
                         # Formato ID direto
                         cell_ids.append(int(item))
+                        logger.debug("    Extraído cell_id=%d direto", int(item))
                     else:
                         # Tenta converter
                         try:
-                            cell_ids.append(int(item))
+                            cid = int(item)
+                            cell_ids.append(cid)
+                            logger.debug("    Extraído cell_id=%d via conversão", cid)
                         except (ValueError, TypeError):
                             logger.debug("Item de bin não convertido: %s (type=%s)", item, type(item))
+                
+                logger.info("CellFilter: cell_ids extraídos=%s", cell_ids)
                 
                 if len(cell_ids) > 0:
                     # Soma volumes das células
                     total_vol = 0.0
                     for cell_id in cell_ids:
-                        # Tenta obter volume do resumo da geometria
+                        vol = None
+                        
+                        # Método 1: Tenta obter volume do resumo da geometria
                         try:
                             summary = sp.summary
                             if summary and hasattr(summary, 'geometry'):
+                                logger.debug("  Buscando célula %d no summary.geometry", cell_id)
                                 cell = summary.geometry.get_cell_by_id(cell_id)
-                                if cell and hasattr(cell, 'volume') and cell.volume is not None:
-                                    vol = float(cell.volume)
-                                    logger.debug("Célula %d: volume=%.4e cm³", cell_id, vol)
-                                    total_vol += vol
+                                if cell:
+                                    logger.debug("    Célula %d encontrada: %s", cell_id, cell)
+                                    if hasattr(cell, 'volume') and cell.volume is not None:
+                                        vol = float(cell.volume)
+                                        logger.info("    Volume via summary: célula %d = %.4e cm³", cell_id, vol)
+                                    else:
+                                        logger.debug("    Célula %d sem atributo volume ou volume=None", cell_id)
+                                else:
+                                    logger.warning("    Célula %d NÃO encontrada no summary.geometry", cell_id)
+                            else:
+                                logger.debug("  Summary ou summary.geometry não disponível")
                         except Exception as e:
-                            logger.debug("Erro ao obter volume da célula %d: %s", cell_id, e)
-                            pass
+                            logger.error("Erro ao obter volume da célula %d via summary: %s", cell_id, e, exc_info=True)
+                        
+                        # Método 2: Fallback via geometry_result se volume ainda não determinado
+                        if vol is None or vol <= 0:
+                            logger.debug("  Tentando fallback via geometry_result para célula %d", cell_id)
+                            # Procurar em self.geometry_result por cells_dict
+                            cells_dict = self.geometry_result.get("cells_dict", {})
+                            for name, cell_obj in cells_dict.items():
+                                if hasattr(cell_obj, 'id') and cell_obj.id == cell_id:
+                                    if hasattr(cell_obj, 'volume') and cell_obj.volume is not None:
+                                        vol = float(cell_obj.volume)
+                                        logger.info("    Volume via geometry_result: célula %d (%s) = %.4e cm³", 
+                                                   cell_id, name, vol)
+                                    break
+                        
+                        if vol and vol > 0:
+                            total_vol += vol
+                        else:
+                            logger.warning("    Volume NÃO determinado para célula %d", cell_id)
                     
                     if total_vol > 0.0:
-                        logger.info("Volume da região de calibração: %.4e cm³ (células=%s)", total_vol, cell_ids)
+                        logger.info("Volume total da região de calibração: %.4e cm³ (células=%s)", total_vol, cell_ids)
                         return total_vol
                     else:
-                        logger.warning("Nenhum volume válido encontrado para células %s", cell_ids)
+                        logger.error("Nenhum volume válido encontrado para células %s", cell_ids)
         
         logger.warning("_get_calibration_volume: volume não determinado (tally.filters=%s)", 
                       [type(f).__name__ for f in tally.filters])

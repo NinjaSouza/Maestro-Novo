@@ -322,32 +322,77 @@ class SimulationRunner:
     # ── Leitura de tallies ────────────────────────────────────────────────────
 
     def _read_tally(self, sp: openmc.StatePoint, cell_id: int, name: str) -> float:
-        # FIX BUG 4: (a) aceita variantes de nome de score; (b) achata df["mean"] array
-        def _safe_mean_sum(series) -> float:
-            try:
-                return float(np.sum([np.sum(v) for v in series]))
-            except Exception:
-                return float(series.apply(lambda x: float(np.sum(x))).sum())
+        """
+        Lê valor de tally para uma célula e score específicos.
+        
+        FIX V250: Substitui get_pandas_dataframe() por get_values() para evitar
+        erro 'setting an array element with a sequence' no OpenMC 0.15.3.
+        """
         try:
-            tally    = sp.get_tally(name=name)
-            df       = tally.get_pandas_dataframe()
-            cell_col = next((c for c in ("cell id", "cell") if c in df.columns), None)
-            if cell_col is None:
+            tally = sp.get_tally(name=name)
+            
+            # Extrai valores usando get_values() - mais robusto que pandas
+            mean_values = tally.get_values(value='mean')
+            if mean_values is None:
+                self.logger.debug("_read_tally('%s', cell=%d): get_values retornou None", name, cell_id)
                 return 0.0
-            mask = df[cell_col] == cell_id
-            if "score" in df.columns:
-                score_mask = df["score"] == name
-                if score_mask.any():
-                    mask = mask & score_mask
-            rows = df[mask]
-            if rows.empty:
+            
+            # Converte para array numpy e extrai informações do filtro
+            mean_array = np.asarray(mean_values)
+            
+            # Tenta identificar a célula através dos filtros do tally
+            cell_filter = None
+            for f in tally.filters:
+                if isinstance(f, openmc.CellFilter):
+                    cell_filter = f
+                    break
+            
+            if cell_filter is None:
+                # Sem CellFilter, retorna soma total
+                v = float(np.sum(mean_array))
+                v = v if v >= 0.0 else 0.0
+                self.logger.debug("_read_tally('%s', cell=%d): %.4e (sem filtro)", name, cell_id, v)
+                return v
+            
+            # Mapeia bins do filter para índices do array
+            # Em OpenMC 0.15.3, bins pode ser lista de tuplas ou IDs diretos
+            bins = getattr(cell_filter, 'bins', getattr(cell_filter, 'cells', []))
+            
+            # Extrai IDs das células dos bins
+            cell_ids_in_filter = []
+            for b in bins:
+                if isinstance(b, (tuple, list)):
+                    # Formato: (cell_id, weight) ou similar
+                    cell_ids_in_filter.append(int(b[0]))
+                else:
+                    # Formato: cell_id direto
+                    cell_ids_in_filter.append(int(b))
+            
+            # Encontra índice da célula desejada
+            try:
+                idx = cell_ids_in_filter.index(cell_id)
+            except ValueError:
+                # Célula não encontrada neste tally
+                self.logger.debug("_read_tally('%s', cell=%d): célula não está no filtro", name, cell_id)
                 return 0.0
-            v = _safe_mean_sum(rows["mean"])
+            
+            # Extrai valor para esta célula
+            # O array pode ter múltiplas dimensões dependendo dos filters
+            if mean_array.ndim == 1:
+                v = float(mean_array[idx])
+            elif mean_array.ndim == 2:
+                # Soma sobre todas as colunas para esta linha
+                v = float(np.sum(mean_array[idx]))
+            else:
+                # Para arrays multidimensionais, soma sobre todos os eixos exceto o primeiro
+                v = float(np.sum(mean_array[idx]))
+            
             v = v if v >= 0.0 else 0.0
-            self.logger.debug("_read_tally('%s', cell=%d): %.4e  n_rows=%d", name, cell_id, v, len(rows))
+            self.logger.debug("_read_tally('%s', cell=%d): %.4e", name, cell_id, v)
             return v
+            
         except Exception as exc:
-            self.logger.debug("_read_tally('%s', cell=%d): %s", name, cell_id, exc)
+            self.logger.debug("_read_tally('%s', cell=%d): exceção: %s", name, cell_id, exc)
             return 0.0
 
     # ── Settings e modelo ─────────────────────────────────────────────────────
@@ -941,32 +986,76 @@ class SimulationRunner:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _record_timestep_power(self, sp_path, source_rate, step_idx, t_start_h, t_end_h, dt_s) -> TimestepResult:
+        """
+        Registra potência por camada para um timestep.
+        
+        FIX V250: Adiciona fallback para 'energy-deposition' e logging detalhado
+        para diagnosticar potência zero mesmo com fissões ocorrendo.
+        """
         _empty = TimestepResult(step_idx=step_idx, t_start_h=t_start_h, t_end_h=t_end_h, dt_s=dt_s, power_total_W=0.0)
         if not sp_path or not sp_path.exists():
+            self.logger.error("StatePoint não encontrado: %s", sp_path)
             return _empty
 
         layers_power, P_total = [], 0.0
         try:
             with openmc.StatePoint(str(sp_path)) as sp:
                 all_cells = list(self.geometry.get_all_cells().values())
+                self.logger.debug("_record_timestep_power: %d células encontradas", len(all_cells))
+                
+                # Primeiro tenta ler 'heating'
                 for cell in all_cells:
                     h_eV = self._read_tally(sp, cell.id, "heating")
                     p_W  = float(h_eV) * source_rate * _EV_TO_J
                     P_total += p_W
+                    self.logger.debug(
+                        "Célula %s (id=%d): heating=%.4e eV/src → power=%.4e W",
+                        self._cell_name(cell), cell.id, h_eV, p_W
+                    )
                     layers_power.append(LayerPower(layer_name=self._cell_name(cell), cell_id=cell.id, heating_eV=h_eV, power_W=p_W))
 
+                # Se heating falhou (zero), tenta 'energy-deposition' como fallback
                 if P_total == 0.0:
+                    self.logger.info("heating zerado, tentando fallback para 'energy-deposition'...")
+                    P_ed = 0.0
+                    for i, cell in enumerate(all_cells):
+                        ed_eV = self._read_tally(sp, cell.id, "energy-deposition")
+                        ed_W  = float(ed_eV) * source_rate * _EV_TO_J
+                        P_ed += ed_W
+                        if ed_W > 0:
+                            self.logger.debug(
+                                "Célula %s (id=%d): energy-deposition=%.4e eV/src → power=%.4e W",
+                                self._cell_name(cell), cell.id, ed_eV, ed_W
+                            )
+                        if i < len(layers_power):
+                            layers_power[i] = LayerPower(layer_name=layers_power[i].layer_name, cell_id=layers_power[i].cell_id, heating_eV=ed_eV, power_W=ed_W)
+                    if P_ed > 0.0:
+                        P_total = P_ed
+                        self.logger.info("energy-deposition retornou potência não-nula: %.4e W", P_total)
+                
+                # Se ainda zero, tenta 'kappa-fission' (apenas para materiais físsil)
+                if P_total == 0.0:
+                    self.logger.info("energy-deposition também zerado, tentando fallback para 'kappa-fission'...")
                     P_kf = 0.0
                     for i, cell in enumerate(all_cells):
                         kf_eV = self._read_tally(sp, cell.id, "kappa-fission")
                         kf_W  = float(kf_eV) * source_rate * _EV_TO_J
                         P_kf += kf_W
+                        if kf_W > 0:
+                            self.logger.debug(
+                                "Célula %s (id=%d): kappa-fission=%.4e eV/src → power=%.4e W",
+                                self._cell_name(cell), cell.id, kf_eV, kf_W
+                            )
                         if i < len(layers_power):
                             layers_power[i] = LayerPower(layer_name=layers_power[i].layer_name, cell_id=layers_power[i].cell_id, heating_eV=kf_eV, power_W=kf_W)
                     if P_kf > 0.0:
                         P_total = P_kf
+                        self.logger.info("kappa-fission retornou potência não-nula: %.4e W", P_total)
+                        
+                self.logger.info("Potência total do timestep %d: %.4e W", step_idx, P_total)
+                        
         except Exception as exc:
-            self.logger.error("G6: erro ao ler tally (step=%d): %s", step_idx, exc)
+            self.logger.error("G6: erro ao ler tally (step=%d): %s", step_idx, exc, exc_info=True)
 
         return TimestepResult(step_idx=step_idx, t_start_h=t_start_h, t_end_h=t_end_h,
                               dt_s=dt_s, power_total_W=P_total, layers=layers_power)
