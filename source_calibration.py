@@ -659,22 +659,25 @@ class SourceCalibrator:
                         vol = None
                         
                         # Método 1: Tenta obter volume do resumo da geometria
+                        # OpenMC Summary.geometry não tem get_cell_by_id, precisamos iterar sobre cells
                         try:
                             summary = sp.summary
-                            if summary and hasattr(summary, 'geometry'):
-                                logger.debug("  Buscando célula %d no summary.geometry", cell_id)
-                                cell = summary.geometry.get_cell_by_id(cell_id)
-                                if cell:
-                                    logger.debug("    Célula %d encontrada: %s", cell_id, cell)
-                                    if hasattr(cell, 'volume') and cell.volume is not None:
-                                        vol = float(cell.volume)
-                                        logger.info("    Volume via summary: célula %d = %.4e cm³", cell_id, vol)
-                                    else:
-                                        logger.debug("    Célula %d sem atributo volume ou volume=None", cell_id)
+                            if summary and hasattr(summary, 'geometry') and hasattr(summary.geometry, 'cells'):
+                                logger.debug("  Buscando célula %d no summary.geometry.cells", cell_id)
+                                # summary.geometry.cells é uma lista de objetos Cell
+                                for cell in summary.geometry.cells:
+                                    if hasattr(cell, 'id') and cell.id == cell_id:
+                                        logger.debug("    Célula %d encontrada: %s (name=%s)", cell_id, cell, getattr(cell, 'name', 'N/A'))
+                                        if hasattr(cell, 'volume') and cell.volume is not None:
+                                            vol = float(cell.volume)
+                                            logger.info("    Volume via summary: célula %d = %.4e cm³", cell_id, vol)
+                                        else:
+                                            logger.debug("    Célula %d sem atributo volume ou volume=None", cell_id)
+                                        break
                                 else:
-                                    logger.warning("    Célula %d NÃO encontrada no summary.geometry", cell_id)
+                                    logger.warning("    Célula %d NÃO encontrada no summary.geometry.cells", cell_id)
                             else:
-                                logger.debug("  Summary ou summary.geometry não disponível")
+                                logger.debug("  Summary ou summary.geometry ou summary.geometry.cells não disponível")
                         except Exception as e:
                             logger.error("Erro ao obter volume da célula %d via summary: %s", cell_id, e, exc_info=True)
                         
