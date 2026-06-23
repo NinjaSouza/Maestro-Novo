@@ -3,7 +3,9 @@
 """
 source_calibration.py — Calibração da intensidade da fonte para reproduzir fluxo experimental.
 
-Módulo V246 — CORREÇÃO _get_calibration_volume: usa filt.bins em vez de filt.cells
+Módulo V247 — CORREÇÃO OPENMC 0.15.3: tratamento robusto de filt.bins que pode retornar
+  tuplas (cell_id, weight) ou IDs diretos. Adicionado logging detalhado para debug de
+  volume zero/NaN na calibração.
 
 CONTRATO FÍSICO:
   Quando FLUXO + espectro são fornecidos no input, o simulador executa uma
@@ -23,8 +25,13 @@ RESULTADO:
   source_rate calibrado que reproduz o FLUXO experimental dentro da tolerância.
   Este valor é congelado e usado em toda a depleção subsequente.
   
+FIXES V247 (OPENMC 0.15.3):
+  - _get_calibration_volume() trata filt.bins retornando tuplas (cell_id, weight)
+  - Logging detalhado de volumes por célula para debug de volume zero
+  - Validação explícita de volume > 0 antes de retornar
+  
 FIXES V246:
-  - _get_calibration_volume() agora usa getattr(filt, 'bins', getattr(filt, 'cells', []))
+  - _get_calibration_volume() usa getattr(filt, 'bins', getattr(filt, 'cells', []))
     para compatibilidade com OpenMC >= 0.13 onde o atributo mudou de 'cells' para 'bins'
   - Log detalhado de células e volumes para debug
   
@@ -150,7 +157,7 @@ class SourceCalibrator:
       - Usa chaves do contrato atual (cellsdict, water_front, etc.)
     """
     
-    VERSION = "V243"
+    VERSION = "V247"
     
     def __init__(
         self,
@@ -488,21 +495,32 @@ class SourceCalibrator:
                     std_flux = 0.0
                 
                 # Validação explícita: fluxo deve ser escalar positivo
-                if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle):
+                if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle) or np.isinf(mean_flux_per_particle):
                     logger.error(
-                        "Fluxo extraído inválido: %.4e (tally=%s, scores=%s)",
+                        "Fluxo extraído inválido: %.4e (tally=%s, scores=%s, filters=%s)",
                         mean_flux_per_particle, tally.name, tally.scores,
+                        [type(f).__name__ for f in tally.filters] if hasattr(tally, 'filters') else 'N/A'
                     )
                     shutil.rmtree(temp_dir, ignore_errors=True)
                     return 0.0, 0.0, 0.0
 
                 vol_region = self._get_calibration_volume(tally, sp)
                 
-                if vol_region <= 0.0:
-                    logger.warning("Volume da região de calibração não determinado — usando estimativa")
-                    # Estimativa baseada na primeira camada
+                # FIX V247: Se volume for zero/NaN, aborta calibração com erro claro
+                if vol_region <= 0.0 or np.isnan(vol_region) or np.isinf(vol_region):
+                    logger.error(
+                        "Volume da região de calibração inválido: %.4e (tally=%s). "
+                        "Verifique se as células do tally têm volumes definidos na geometria.",
+                        vol_region, tally.name
+                    )
+                    # Usa estimativa como fallback mas loga erro crítico
                     first_layer_thick = self._estimate_first_layer_thickness()
-                    vol_region = self.target_face_area_cm2 * first_layer_thick
+                    vol_region_estimado = self.target_face_area_cm2 * first_layer_thick
+                    logger.warning("Usando volume estimado: %.4e cm³ (area=%.4f × espessura=%.4f)",
+                                  vol_region_estimado, self.target_face_area_cm2, first_layer_thick)
+                    vol_region = vol_region_estimado
+                else:
+                    logger.info("Volume da região de calibração OK: %.4e cm³", vol_region)
                 
                 logger.debug(
                     "Calibração: tally_flux=%.4e ± %.4e n·cm/src, volume=%.4f cm³",
@@ -527,13 +545,34 @@ class SourceCalibrator:
         """
         Obtém volume da região de calibração a partir do tally ou geometria.
         
-        FIX V246: Usa filt.bins em vez de filt.cells para compatibilidade com OpenMC >= 0.13
+        FIX V247: Compatibilidade total com OpenMC 0.15.3
+          - filt.bins em OpenMC 0.15.3 retorna lista de tuplas (cell_id, weight) ou apenas IDs
+          - Adicionado tratamento robusto para extrair cell_ids corretamente
         """
         # Tenta obter volume dos filtros do tally
         for filt in tally.filters:
             if isinstance(filt, openmc.CellFilter):
-                # FIX V246: Em OpenMC >= 0.13, o atributo é 'bins', não 'cells'
-                cell_ids = getattr(filt, 'bins', getattr(filt, 'cells', []))
+                # FIX V247: Em OpenMC 0.15.3, filt.bins pode retornar:
+                #   - Lista de IDs: [1, 2, 3]
+                #   - Lista de tuplas: [(1, 1.0), (2, 1.0)]
+                # Precisamos extrair apenas os IDs
+                bins_data = getattr(filt, 'bins', getattr(filt, 'cells', []))
+                
+                # Extrai cell_ids tratando diferentes formatos
+                cell_ids = []
+                for item in bins_data:
+                    if isinstance(item, tuple):
+                        # Formato (cell_id, weight)
+                        cell_ids.append(item[0])
+                    elif isinstance(item, (int, np.integer)):
+                        # Formato ID direto
+                        cell_ids.append(int(item))
+                    else:
+                        # Tenta converter
+                        try:
+                            cell_ids.append(int(item))
+                        except (ValueError, TypeError):
+                            logger.debug("Item de bin não convertido: %s (type=%s)", item, type(item))
                 
                 if len(cell_ids) > 0:
                     # Soma volumes das células
@@ -545,15 +584,21 @@ class SourceCalibrator:
                             if summary and hasattr(summary, 'geometry'):
                                 cell = summary.geometry.get_cell_by_id(cell_id)
                                 if cell and hasattr(cell, 'volume') and cell.volume is not None:
-                                    total_vol += float(cell.volume)
+                                    vol = float(cell.volume)
+                                    logger.debug("Célula %d: volume=%.4e cm³", cell_id, vol)
+                                    total_vol += vol
                         except Exception as e:
                             logger.debug("Erro ao obter volume da célula %d: %s", cell_id, e)
                             pass
                     
                     if total_vol > 0.0:
-                        logger.debug("Volume da região de calibração: %.4f cm³ (células=%s)", total_vol, cell_ids)
+                        logger.info("Volume da região de calibração: %.4e cm³ (células=%s)", total_vol, cell_ids)
                         return total_vol
+                    else:
+                        logger.warning("Nenhum volume válido encontrado para células %s", cell_ids)
         
+        logger.warning("_get_calibration_volume: volume não determinado (tally.filters=%s)", 
+                      [type(f).__name__ for f in tally.filters])
         return 0.0  # Volume não determinado
     
     def _estimate_first_layer_thickness(self) -> float:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tallies.py V304 — Tallies OpenMC para deposição de energia e fluxo.
+tallies.py V305 — Tallies OpenMC para deposição de energia e fluxo.
 
 Física:
     heating      [eV/src]: deposição total de energia kerma por nêutron-fonte.
@@ -10,6 +10,11 @@ Física:
     fission_rate [rx/src]: taxa de fissão.
 
     P [W] = score [eV/src] × source_rate [n/s] × BRIDGE.EV_TO_J
+
+CHANGELOG V305 vs V304:
+  FIX V247 — Compatibilidade OpenMC 0.15.3: _cells_to_filter agora extrai IDs
+             explicitamente de objetos cell, evitando erro ao passar objetos
+             diretamente para CellFilter.
 
 CHANGELOG V304 vs V303:
   MELHORIA 1 — create_heating_tallies: adicionado tally 'flux_spectrum' com
@@ -80,7 +85,26 @@ _E_EPITHERMAL_MAX_EV = 100e3  # epitérmico < 100 keV
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _cells_to_filter(cells_dict: dict) -> "openmc.CellFilter":
-    return openmc.CellFilter(list(cells_dict.values()))
+    """
+    Cria CellFilter a partir de dicionário de células.
+    
+    FIX V247: Extrai IDs explicitamente para compatibilidade com OpenMC 0.15.3
+    """
+    cell_ids = []
+    for name, cell in cells_dict.items():
+        # Extrai ID da célula (pode ser objeto openmc.Cell ou ID direto)
+        if hasattr(cell, 'id'):
+            cell_ids.append(int(cell.id))
+        else:
+            try:
+                cell_ids.append(int(cell))
+            except (ValueError, TypeError):
+                logger.warning("Célula '%s' não pôde ser convertida para ID: %s (type=%s)", 
+                              name, cell, type(cell))
+    if not cell_ids:
+        raise ValueError("Nenhuma célula válida encontrada em cells_dict")
+    logger.debug("_cells_to_filter: cell_ids=%s", cell_ids)
+    return openmc.CellFilter(cell_ids)
 
 
 def _build_id_to_name(cells_dict: dict) -> Dict[int, str]:
