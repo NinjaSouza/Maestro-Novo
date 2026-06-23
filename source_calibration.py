@@ -3,7 +3,7 @@
 """
 source_calibration.py — Calibração da intensidade da fonte para reproduzir fluxo experimental.
 
-Módulo V245 — CORREÇÕES OPENMC 0.15.3: CellFilter com IDs e get_values() robusto
+Módulo V246 — CORREÇÃO _get_calibration_volume: usa filt.bins em vez de filt.cells
 
 CONTRATO FÍSICO:
   Quando FLUXO + espectro são fornecidos no input, o simulador executa uma
@@ -22,6 +22,11 @@ ALGORITMO:
 RESULTADO:
   source_rate calibrado que reproduz o FLUXO experimental dentro da tolerância.
   Este valor é congelado e usado em toda a depleção subsequente.
+  
+FIXES V246:
+  - _get_calibration_volume() agora usa getattr(filt, 'bins', getattr(filt, 'cells', []))
+    para compatibilidade com OpenMC >= 0.13 onde o atributo mudou de 'cells' para 'bins'
+  - Log detalhado de células e volumes para debug
   
 FIXES V245 (OPENMC 0.15.3):
   - CellFilter agora usa IDs inteiros, não objetos cell (compatibilidade OpenMC 0.15.3)
@@ -521,16 +526,19 @@ class SourceCalibrator:
     def _get_calibration_volume(self, tally: openmc.Tally, sp: openmc.StatePoint) -> float:
         """
         Obtém volume da região de calibração a partir do tally ou geometria.
+        
+        FIX V246: Usa filt.bins em vez de filt.cells para compatibilidade com OpenMC >= 0.13
         """
         # Tenta obter volume dos filtros do tally
         for filt in tally.filters:
             if isinstance(filt, openmc.CellFilter):
-                # Obtém células do filtro
-                cells = filt.cells
-                if len(cells) > 0:
+                # FIX V246: Em OpenMC >= 0.13, o atributo é 'bins', não 'cells'
+                cell_ids = getattr(filt, 'bins', getattr(filt, 'cells', []))
+                
+                if len(cell_ids) > 0:
                     # Soma volumes das células
                     total_vol = 0.0
-                    for cell_id in cells:
+                    for cell_id in cell_ids:
                         # Tenta obter volume do resumo da geometria
                         try:
                             summary = sp.summary
@@ -538,10 +546,12 @@ class SourceCalibrator:
                                 cell = summary.geometry.get_cell_by_id(cell_id)
                                 if cell and hasattr(cell, 'volume') and cell.volume is not None:
                                     total_vol += float(cell.volume)
-                        except Exception:
+                        except Exception as e:
+                            logger.debug("Erro ao obter volume da célula %d: %s", cell_id, e)
                             pass
                     
                     if total_vol > 0.0:
+                        logger.debug("Volume da região de calibração: %.4f cm³ (células=%s)", total_vol, cell_ids)
                         return total_vol
         
         return 0.0  # Volume não determinado
