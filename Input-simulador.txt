@@ -1,0 +1,132 @@
+# ============================================================================
+# INPUT-SIMULADOR.TXT V2.0 
+# ============================================================================
+# MODO DE SIMULAÇÃO (obrigatório)
+# ============================================================================
+# CRITICALITY: Para sistemas críticos com eigenvalue depletion
+# ACTIVATION:  Para ativação neutrónica com fixed source depletion  
+# BURNUP:      
+# AUTO:        Detecção automática baseada na quantidade de físsil
+SIMULATION_MODE ACTIVATION
+
+# ============================================================================
+# PARÂMETROS TEMPORAIS
+# ============================================================================
+TEMPO_TOTAL_H 168		# Tempo total de irradiação (horas)
+DT_H 12				# Timestep inicial (horas)
+TIMESTEP_ADAPTATIVO false	# Timesteps adaptativos (true/false)
+TEMPO_DE_RESFRIAMENTO_H 12
+
+# ============================================================================
+# PARÂMETROS DE SIMULAÇÃO OPENMC
+# ============================================================================
+NEUTRONS_POR_PASSO 10000	# Nêutrons por batch
+BATCHES 10                     # Número de batches ativos
+INACTIVE_BATCHES 1		# Número de batches inativos (burnup)
+
+# ============================================================================
+# FONTE DE NÊUTRONS
+# ============================================================================
+FLUXO 2e14                       # Fluxo neutrónico (n/cm²/s)
+FONTE_TEMPERATURA_K 331            # Temperatura da fonte (K)
+
+# Energia específica da fonte (opcional - se não especificar, usa Maxwell-Boltzmann)
+# ENERGIA_DA_FONTE 0.025           # 25 meV (térmicos)
+# ENERGIA_DA_FONTE 2.45e6        # 2.45 MeV (D-D) (usa distribuição de Watt)  
+# ENERGIA_DA_FONTE 0.025 e 2.4e6 # Espectro Mawell-Boltzman (T) e Watt (rapidos) + somatorio dos 2 para epitermicos
+# ENERGIA_DA_FONTE Maxwell + Watt(a=0.988e6,b=2.249e-6)
+# ENERGIA_DA_FONTE ORIGEN252
+ENERGIA_DA_FONTE ORIGEN252 w_th=0.92 w_epi=0.08 w_fast=0.00
+
+# ============================================================================
+# DIMENSÕES DO ALVO
+# ============================================================================
+# IMPORTANTE: A área (x × y) é usada para calcular densidade automaticamente
+x 2.4	# Largura em cm
+y 17.0	# Comprimento em cm
+
+# ============================================================================
+# REFRIGERAÇÃO (opcional)
+# ============================================================================
+WATER_TEMPERATURE 40.0           # Temperatura da água (°C)
+WATER_FLOW_RATE 0.003            # Vazão (m³/s)
+
+# ============================================================================
+# CONFIGURAÇÕES TÉCNICAS
+# ============================================================================
+USE_GPU true                     # Usar GPU se disponível
+CHAIN_FILE chain_endfb80_pwr.xml # Biblioteca de depleção
+THERMAL_COUPLING false           # Acoplamento térmico (true/false)
+
+# ============================================================================
+# DEFINIÇÃO DAS CAMADAS
+# ============================================================================
+# FORMATO (MASSAS EM GRAMAS):
+# CAMADA <número>
+# ESPESSURA <valor_em_mm>
+# <ISÓTOPO> <MASSA_EM_GRAMAS>
+# <ISÓTOPO> <MASSA_EM_GRAMAS>
+# ...
+# - Exemplo: U235 1.77  (significa 1.77 gramas de U-235)
+# NOTA FÍSICA: Calculados internamente
+# 1 - Densidade massica = soma_massas_isotopes / volume_camada 
+# 2 - Densidade atomica = soma_atomos / volume_camada 
+# 3 - volume_camada = (x × y) × (ESPESSURA/10)  [cm² × cm = cm³]
+# ============================================================================
+
+CAMADA 1
+ESPESSURA 0.3
+Al27 3.2354 
+Mg24 0.0261
+Mg25 0.0033
+Mg26 0.0036
+Si28 0.0182
+Si29 0.0009
+Si30 0.0006
+Fe54 0.0006
+Fe56 0.0091
+Fe57 0.0002
+
+CAMADA 2
+ESPESSURA 0.92
+Al27 28.56
+U235 1.770
+U238 7.183
+U234 0.005
+
+CAMADA 3
+ESPESSURA 0.3
+Al27 3.2354 
+Mg24 0.0261
+Mg25 0.0033
+Mg26 0.0036
+Si28 0.0182
+Si29 0.0009
+Si30 0.0006
+Fe54 0.0006
+Fe56 0.0091
+Fe57 0.0002
+ 	
+# ============================================================================
+# VALIDAÇÃO DE ENTRADA
+# ============================================================================
+#
+# O parser valida:
+# ✓ Soma de massas > 0 (camada não vazia)
+# ✓ Densidade calculada no range físico (0.1 - 20 g/cm³)
+# ✓ Isótopos válidos (formato: Al27, U235, etc.)
+# ✓ Espessuras > 0
+
+# ============================================================================
+# OUTPUTS ESPERADOS
+# ============================================================================
+#
+# 1. depletion_results.h5        - Resultados OpenMC (HDF5)
+# 2. outputs/csvs/Inventario.csv - Massa (g) por isótopo × timestep
+# 3. outputs/csvs/Atividade.csv  - Atividade (Bq) por isótopo × timestep
+# 4. outputs/csvs/Temperatura.csv - Temperatura (K) por camada × timestep
+# 5. logs/simulador_v51_*.log    - Log completo da simulação
+#
+# ============================================================================
+# FIM DO ARQUIVO
+# ============================================================================

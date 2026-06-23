@@ -1,0 +1,138 @@
+# ============================================================================
+# INPUT-FASES.TXT V6.1 - CONFIGURAÇÃO DE MATERIAIS TÉRMICOS
+# ============================================================================
+#
+# Ativa o modo térmico avançado quando THERMAL_COUPLING = true no simulador.
+# Se ausente ou inválido, o sistema usa composição básica do Input-simulador.txt
+#
+# ============================================================================
+# FORMATO (obrigatório — 4 campos separados por espaço/tab):
+#
+#   CAMADA_ID   MATERIAL   MASSA_G   TEMP_K
+#
+#   • CAMADA_ID : nome da camada (deve coincidir com as camadas do simulador)
+#                 Use CAMADA1, CAMADA2, etc. — sem espaço
+#   • MATERIAL  : nome ou alias do material (ver tabela abaixo)
+#                 Case-insensitive: UO2_20 = uo2_20
+#   • MASSA_G   : massa do material nesta camada, em gramas (float)
+#                 Decimais permitidos: 10.5, 0.001725
+#   • TEMP_K    : temperatura inicial da camada, em Kelvin (float)
+#                 Mínimo: 250 K | Máximo: 3500 K
+#                 Temperatura ambiente = 300.0 K
+#
+# REGRA: Uma linha por par (camada, material).
+#        Uma camada com 2 materiais = 2 linhas com mesmo CAMADA_ID.
+#        As massas não precisam somar exatamente — o parser calcula as
+#        frações mássicas automaticamente: fração_i = massa_i / soma_total.
+#
+# COMENTÁRIOS: qualquer texto após '#' é ignorado.
+# LINHAS COM < 4 CAMPOS: ignoradas com warning no log.
+# ============================================================================
+
+# ============================================================================
+# DADOS ATIVOS (preencha abaixo — remova ou comente o que não usar)
+# ============================================================================
+
+# Exemplo com 1 camada e 2 materiais (seu caso atual):
+# CAMADA_ID     MATERIAL        MASSA_G     TEMP_K
+CAMADA_1    Aluminum, Alloy 6061-T6    3.31    313
+# CAMADA_2: fases cristalinas do combustível UAl para propriedades térmicas.
+# Input-fases é responsável APENAS pelo solver térmico (k, cp, rho T-dependentes).
+# A simulação neutrônica usa Input-simulador.txt (isótopos explícitos).
+# Os nomes UAl2_20, UAl3_20, UAl4_20 são chaves canônicas em pyne_bridge.MATERIALS
+# e _THERMAL_CORR — resolvem diretamente sem alias. Não alterar.
+#
+# Composição de fases determinada por metalografia/difração de raios-X:
+#   UAl2_20: fase intermetálica U Al₂ (cúbica C15), ρ=8.1 g/cm³, Tfus=1623K
+#   UAl3_20: fase intermetálica U Al₃ (cúbica L12), ρ=6.8 g/cm³, Tfus=1583K
+#   UAl4_20: fase intermetálica U Al₄ (ortorrômbica), ρ=6.1 g/cm³, Tfus=1560K
+#   Al:      alumínio livre (matriz), ρ=2.70 g/cm³, Tfus=933K
+CAMADA_2    UAl2_20                    1.187   313
+CAMADA_2    UAl3_20                    3.739   313
+CAMADA_2    UAl4_20                    6.944   313
+CAMADA_2    Al                        25.220   313
+CAMADA_3    Aluminum, Alloy 6061-T6    3.31    313
+
+
+# ============================================================================
+# MAPA COMPLETO DE ALIASES (nome no arquivo → chave interna no PyNEBridge)
+# ============================================================================
+#
+# ── COMBUSTÍVEIS (customizados) ──────────────────────────────────────────────
+#   uranio metalico 20    →  uranio_metalico_20     (U metálico, enr. 20%)
+#   uranio metalico 93    →  uranio_metalico_93     (U metálico, enr. 93%)
+#   uranio metalico nat   →  uranio_metalico_nat    (U metálico natural)
+#   UO2_20                →  UO2_20                 (UO₂ enriquecido 20%)
+#   UO2 20                →  UO2_20                 (alias com espaço)
+#   UO2_45                →  UO2_45                 (UO₂ enriquecido 45%)
+#   UO2_93                →  UO2_93                 (UO₂ enriquecido 93%)
+#   liga alU 20           →  UAlx_20                (liga Al-U, enr. 20%)
+#   liga alU 93           →  UAlx_93                (liga Al-U, enr. 93%)
+#   UZrH                  →  UZrHx                  (hidreto U-Zr)
+#
+# ── METAIS PUROS (nomes PyNE/PNNL exatos) ────────────────────────────────────
+#   aluminio puro         →  Al
+#   zinco                 →  Zn
+#   Zn                    →  Zn                     (alias direto)
+#   cobre                 →  Cu
+#   ferro                 →  Fe
+#   niquel                →  Ni
+#   chumbo                →  Pb
+#   titanio               →  Ti
+#   cromo                 →  Cr
+#   molibdenio            →  Mo
+#   magnesio              →  Mg
+#   zirconio              →  Zr
+#   berilio               →  Beryllium
+#   boro                  →  Boron
+#   grafite               →  Graphite
+#
+# ── LIGAS (nomes PyNE/PNNL exatos) ───────────────────────────────────────────
+#   aluminio 6061         →  Aluminum, Alloy 6061-T6
+#   aluminio 2024         →  Aluminum, Alloy 2024-T4
+#   aluminio 7075         →  Aluminum, Alloy 7075
+#   aco inox 304          →  Steel, Stainless 304
+#   aco inox 316          →  Steel, Stainless 316
+#   aco inox 440          →  Steel, Stainless 440
+#   zircaloy 2            →  Zircaloy-2
+#   zircaloy 4            →  Zircaloy-4
+#   inconel 600           →  Inconel-600
+#   inconel 718           →  Inconel-718
+#   latao                 →  Brass
+#   bronze                →  Bronze
+#
+# ── MODERADORES / REFRIGERANTES ──────────────────────────────────────────────
+#   agua                  →  Water, Liquid
+#   agua pesada           →  Heavy Water
+#   agua boro 500         →  Water, Borated 0.05%
+#   agua boro 1000        →  Water, Borated 0.1%
+#   ZrH2                  →  Zirconium Hydride (Zr5H8)
+#   BeO                   →  Beryllium Oxide
+#
+# ── ABSORVEDORES ─────────────────────────────────────────────────────────────
+#   B4C                   →  Boron Carbide
+#   hafnio                →  Hf
+#   gadolinio             →  Gd
+#   Ag-In-Cd              →  Silver-Indium-Cadmium
+#   cadmio                →  Cd
+#
+# ── ORGÂNICOS / BLINDAGEM ────────────────────────────────────────────────────
+#   parafina              →  Paraffin
+#   polietileno           →  Polyethylene
+#   oleo                  →  Oil, Mineral
+#   concreto              →  Concrete, Regular
+#   concreto baritado     →  Concrete, Barite
+#   pyrex                 →  Glass, Borosilicate (Pyrex)
+#   acrilico              →  Lucite
+#
+# ── DOSIMETRIA / REFERÊNCIA ──────────────────────────────────────────────────
+#   tecido mole           →  Tissue, Soft (ICRU Four-Component)
+#   agua ICRU             →  Water (ICRU)
+#   ar                    →  Air, Dry (near sea level)
+#
+# ── TEMPERATURAS DE REFERÊNCIA (K) ───────────────────────────────────────────
+#   450.0 K  → operação típica de reator (177 °C)
+#   573.0 K  → operação PWR (300 °C)
+#   900.0 K  → temperatura de combustível UO₂ baixa potência
+#   1200.0 K → temperatura de combustível UO₂ alta potência
+#   1500.0 K → limite operacional de elementos combustíveis
