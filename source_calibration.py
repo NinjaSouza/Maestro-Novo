@@ -3,7 +3,7 @@
 """
 source_calibration.py — Calibração da intensidade da fonte para reproduzir fluxo experimental.
 
-Módulo V239 — IMPLEMENTAÇÃO CORRIGIDA PARA PRODUÇÃO
+Módulo V241 — IMPLEMENTAÇÃO CORRIGIDA PARA PRODUÇÃO
 
 CONTRATO FÍSICO:
   Quando FLUXO + espectro são fornecidos no input, o simulador executa uma
@@ -23,7 +23,14 @@ RESULTADO:
   source_rate calibrado que reproduz o FLUXO experimental dentro da tolerância.
   Este valor é congelado e usado em toda a depleção subsequente.
   
-FIXES V239:
+FIXES V241:
+  - Extração robusta de fluxo do tally pandas DataFrame para arrays aninhados
+  - Implementação _safe_extract_flux usando np.asarray().ravel() para evitar
+    erro "setting an array element with a sequence" do numpy
+  - Log detalhado de dtypes do DataFrame para debug
+  - Validação explícita de fluxo > 0 antes de prosseguir
+  
+FIXES V240:
   - Exporta TODOS os XMLs (geometry, materials, settings, tallies) no mesmo diretório
   - Converte corretamente tally por partícula-fonte para fluxo físico [n/cm²/s]
   - Usa chaves corretas do contrato geometry.py (cellsdict, não cells_dict)
@@ -115,6 +122,10 @@ class SourceCalibrator:
       result = calibrator.run()
       source_rate = result.source_rate_calibrated
     
+    FIX V241:
+      - Extração robusta de fluxo com np.asarray().ravel() para evitar erro numpy
+      - Log de dtypes do DataFrame para debug de arrays aninhados
+    
     FIX V239:
       - Recebe openmc.Geometry e openmc.Materials reais
       - Exporta todos XMLs no mesmo diretório temporário
@@ -122,7 +133,7 @@ class SourceCalibrator:
       - Usa chaves do contrato atual (cellsdict, water_front, etc.)
     """
     
-    VERSION = "V239"
+    VERSION = "V241"
     
     def __init__(
         self,
@@ -162,7 +173,7 @@ class SourceCalibrator:
         self._calibration_volume_cm3 = 0.0
         
         logger.info(
-            "SourceCalibrator V239 initialized: flux_target=%.4e n/cm²/s, "
+            "SourceCalibrator V240 initialized: flux_target=%.4e n/cm²/s, "
             "target_area=%.4f cm², source_area=%.4f cm², source_rate_initial=%.4e n/s",
             self.flux_target, self.target_face_area_cm2, self.source_area_cm2, 
             self.source_rate_initial,
@@ -409,17 +420,47 @@ class SourceCalibrator:
 
                 df = tally.get_pandas_dataframe()
 
-                # FIX "setting an array element with a sequence":
-                # get_pandas_dataframe() pode retornar df["mean"] como Series de
-                # arrays numpy (dtype=object). _safe_sum achata qualquer aninhamento.
-                def _safe_sum(series) -> float:
+                # FIX BUG RAIZ V241: Extração robusta de fluxo do tally pandas DataFrame
+                # Em OpenMC ≥ 0.15 com CellFilter + score='flux', df['mean'] pode ser
+                # uma Series de arrays numpy (dtype=object), não de escalares.
+                # O erro 'setting an array element with a sequence' ocorre quando
+                # tentamos converter diretamente sem tratar arrays aninhados.
+                def _safe_extract_flux(series) -> float:
+                    """Extrai valor de fluxo de série pandas, lidando com arrays aninhados."""
                     try:
-                        return float(np.sum([np.sum(v) for v in series]))
-                    except Exception:
-                        return float(series.apply(lambda x: float(np.sum(x))).sum())
+                        total = 0.0
+                        for v in series:
+                            # Converte cada elemento para array numpy e soma
+                            arr = np.asarray(v, dtype=float).ravel()
+                            total += float(arr.sum())
+                        return total
+                    except Exception as exc_inner:
+                        # Fallback: tenta aplicar sum elemento a elemento
+                        try:
+                            return float(series.apply(lambda x: float(np.asarray(x, dtype=float).sum())).sum())
+                        except Exception:
+                            logger.warning(
+                                "_safe_extract_flux falhou em ambos os métodos: %s. "
+                                "Retornando 0.0 para forçar re-tentativa ou fallback.",
+                                exc_inner
+                            )
+                            return 0.0
 
-                mean_flux_per_particle = _safe_sum(df["mean"])
-                std_flux = _safe_sum(df["std. dev."]) if "std. dev." in df.columns else 0.0
+                mean_flux_per_particle = _safe_extract_flux(df["mean"])
+                
+                # Validação explícita: fluxo de tally de fluxo deve ser escalar positivo
+                if mean_flux_per_particle <= 0.0 or np.isnan(mean_flux_per_particle):
+                    logger.error(
+                        "Fluxo extraído inválido: %.4e (tally=%s, df_shape=%s, df_columns=%s, df_dtypes=%s)",
+                        mean_flux_per_particle, tally.name, 
+                        getattr(df, 'shape', 'N/A'), 
+                        list(df.columns) if hasattr(df, 'columns') else 'N/A',
+                        {col: str(df[col].dtype) for col in df.columns} if hasattr(df, 'columns') and hasattr(df, 'dtypes') else 'N/A'
+                    )
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return 0.0, 0.0, 0.0
+                
+                std_flux = _safe_extract_flux(df["std. dev."]) if "std. dev." in df.columns else 0.0
 
                 vol_region = self._get_calibration_volume(tally, sp)
                 
@@ -428,6 +469,11 @@ class SourceCalibrator:
                     # Estimativa baseada na primeira camada
                     first_layer_thick = self._estimate_first_layer_thickness()
                     vol_region = self.target_face_area_cm2 * first_layer_thick
+                
+                logger.debug(
+                    "Calibração: tally_flux=%.4e ± %.4e n·cm/src, volume=%.4f cm³",
+                    mean_flux_per_particle, std_flux, vol_region
+                )
                 
                 # FIX V239: Retorna fluxo POR PARTÍCULA-FONTE e volume separadamente
                 # A conversão para fluxo físico será feita no loop principal

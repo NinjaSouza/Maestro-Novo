@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""simulation.py V238 — Depleção OpenMC com acoplamento térmico-neutrônico e calibração de fonte.
+"""simulation.py V241 — Depleção OpenMC com acoplamento térmico-neutrônico e calibração de fonte.
 
+CHANGELOG V241 vs V238:
+  FIX BUG 1 (CAUSA RAIZ): Calibração falha silenciosamente em source_calibration.py
+    - _safe_extract_flux() reescrito para usar np.asarray(v, dtype=float).ravel()
+    - Evita erro \"setting an array element with a sequence\" do numpy ao lidar
+      com arrays aninhados no pandas DataFrame do tally de fluxo
+    - Log detalhado de dtypes do DataFrame para debug
+    - Validação explícita de fluxo > 0 antes de prosseguir
+  
+  FIX BUG 2: source_rates_list não era atualizado após calibração bem-sucedida
+    - Adicionado método _preview_timesteps() para obter número de timesteps
+    - source_rates_list agora é criado COM O VALOR CALIBRADO, não o inicial
+    - IndependentOperator usa corretamente source_rate calibrado
+  
+  FIX BUG 3: _normalize_material_fractions() causava normalização dupla
+    - Removida normalização sobre atributo privado _nuclides do OpenMC
+    - Materiais já chegam normalizados de geometry.py via add_nuclide(..., \"wo\")
+  
 CHANGELOG V238 vs V237:
   FIX PRINCIPAL — Calibração de fonte implementada conforme contrato físico V238:
     - Quando FLUXO + espectro são fornecidos, executa etapa de calibração
@@ -204,13 +221,23 @@ class SimulationRunner:
         
         norm_mode = self.sp.get("_depletion_normalization", "source-rate")
         
-        # Obter source_rates de system_params (preenchido por maestro com dados do settings.py)
-        # settings.py já calculou source_rate = flux × area corretamente em Phase C
-        source_rates_list = self.sp.get("_source_rates")
-        if not source_rates_list:
-            # Fallback: usa source_rate único calculado em _calc_source_rate()
-            sr_single = source_rate
-            source_rates_list = [sr_single] if sr_single is not None else [1e14]
+        # FIX BUG 3 V241: source_rates_list DEVE ser atualizado com valor calibrado.
+        # O valor retornado por _calibrate_and_get_source_rate() é o source_rate calibrado,
+        # mas _source_rates em system_params pode ainda conter valores não calibrados.
+        # Precisamos garantir que IndependentOperator use o valor CALIBRADO.
+        source_rate_calibrated = source_rate  # Valor já calibrado (ou fallback)
+        
+        # Obter número de timesteps para criar lista consistente
+        dt_s_preview = self._preview_timesteps(source_rate_calibrated)
+        n_steps = len(dt_s_preview) if dt_s_preview else 1
+        
+        # Criar source_rates_list COM O VALOR CALIBRADO, não o inicial
+        source_rates_list = [source_rate_calibrated] * n_steps
+        
+        self.logger.info(
+            "source_rates_list criado com %d timesteps usando source_rate calibrado=%.4e n/s",
+            n_steps, source_rate_calibrated
+        )
         
         # Validar consistência: source_rates deve ter mesma dimensão de dt_s (após diff)
         # ou ser broadcastable. Vamos garantir que tenha pelo menos 1 elemento.
@@ -502,17 +529,10 @@ class SimulationRunner:
         )
 
     def _normalize_material_fractions(self) -> None:
-        for mat in self.materials:
-            try:
-                nuclides = mat._nuclides
-                if not nuclides:
-                    continue
-                total = sum(abs(n[1]) for n in nuclides)
-                if total <= 0.0 or abs(total - 1.0) < 1e-9:
-                    continue
-                mat._nuclides = [(n[0], n[1] / total, n[2]) for n in nuclides]
-            except AttributeError:
-                pass
+        # REMOVIDO V241: Materiais já chegam normalizados de geometry.py.
+        # A normalização dupla sobre _nuclides (atributo privado do OpenMC)
+        # pode causar erros numéricos sutis e não é necessária.
+        pass
 
     def _build_tallies(self) -> openmc.Tallies:
         tallies = openmc.Tallies()
@@ -616,6 +636,29 @@ class SimulationRunner:
         )
 
     # ── Timesteps ─────────────────────────────────────────────────────────────
+
+    def _preview_timesteps(self, source_rate: float) -> list:
+        """
+        FIX V241: Pré-visualiza timesteps para criar source_rates_list consistente.
+        Retorna lista de durações em segundos sem aplicar validações de burnup.
+        """
+        dep_params = self.sp.get("depletion_params") or {}
+        ts_internos = dep_params.get("timesteps_internos_s")
+        if ts_internos is not None and len(ts_internos) > 0:
+            return list(ts_internos)
+        
+        # Fallback: usa diff de output_times_h
+        try:
+            dt_s = np.diff(self.timesteps_h) * 3600.0
+            dt_s = dt_s[dt_s > 0.0]
+            return list(dt_s)
+        except Exception:
+            pass
+        
+        # Fallback extremo
+        dt_h = float(self.sp.get("dt_h", 12.0))
+        n = max(1, round(float(self.sp.get("total_time_h", 48.0)) / dt_h))
+        return [dt_h * 3600.0] * n
 
     def _safe_timesteps(self, source_rate: float) -> np.ndarray:
         """
