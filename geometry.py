@@ -580,15 +580,15 @@ class GeometryBuilder:
             materials_dict["water_reflector"] = mat_water
             openmc_mats.append(mat_water)
 
-        xmin_ext = openmc.XPlane(x0=-(x_cm / 2.0 + dlat), boundary_type="vacuum")
-        xmax_ext = openmc.XPlane(x0=+(x_cm / 2.0 + dlat), boundary_type="vacuum")
-        ymin_ext = openmc.YPlane(y0=-(y_cm / 2.0 + dlat), boundary_type="vacuum")
-        ymax_ext = openmc.YPlane(y0=+(y_cm / 2.0 + dlat), boundary_type="vacuum")
+        xmin_ext = openmc.XPlane(x0=-(x_cm / 2.0 + dlat), boundary_type="reflective")
+        xmax_ext = openmc.XPlane(x0=+(x_cm / 2.0 + dlat), boundary_type="reflective")
+        ymin_ext = openmc.YPlane(y0=-(y_cm / 2.0 + dlat), boundary_type="reflective")
+        ymax_ext = openmc.YPlane(y0=+(y_cm / 2.0 + dlat), boundary_type="reflective")
 
-        z_ext_bot = openmc.ZPlane(z0=-dax, boundary_type="vacuum")
+        z_ext_bot = openmc.ZPlane(z0=-dax, boundary_type="reflective")
         z_wafer_bot = openmc.ZPlane(z0=0.0)
         z_wafer_top = openmc.ZPlane(z0=total_wafer_cm)
-        z_ext_top = openmc.ZPlane(z0=total_wafer_cm + dax, boundary_type="vacuum")
+        z_ext_top = openmc.ZPlane(z0=total_wafer_cm + dax, boundary_type="reflective")
 
         xmin_waf = openmc.XPlane(x0=-x_cm / 2.0)
         xmax_waf = openmc.XPlane(x0=+x_cm / 2.0)

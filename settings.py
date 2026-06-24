@@ -316,17 +316,10 @@ class SettingsBuilder:
         if _OPENMC_OK:
             openmc.config["cross_sections"] = str(xs_path)
 
-        # ── source_rate — ATENÇÃO V238 ───────────────────────────────────────
-        # FIX V238: settings.py NÃO deve mais calcular source_rate final por
-        # heurística de área. O cálculo flux × area é apenas ESTIMATIVA INICIAL
-        # para a calibração que será executada em simulation.py.
-        #
-        # CONTRATO FÍSICO V238:
-        #   Quando FLUXO + espectro são fornecidos, o simulador DEVE executar
-        #   calibração para encontrar source_rate que reproduza o fluxo-alvo.
-        #
-        # Esta etapa calcula apenas source_rate_initial para bootstrap da
-        # calibração. O valor FINAL será determinado por SourceCalibrator.
+        # ── source_rate — MODO FLUX V242 ───────────────────────────────────────
+        # FIX V242: No modo FLUX, NÃO há calibração. O fluxo nominal do reator
+        # é prescrito diretamente por material no IndependentOperator.
+        # source_rate_initial é apenas informativo para logs.
         
         source_rate_initial = flux * area
         if source_rate_initial < _VL.SOURCE_RATE_MIN:
@@ -335,9 +328,11 @@ class SettingsBuilder:
                 f"Verifique FLUXO e dimensões do wafer."
             )
         
+        # Modo FLUX: calibração desativada - fluxo prescrito diretamente
+        calibration_required = False
         logger.info(
-            "source_rate_initial=%.4e n/s (flux×area, será calibrado em Phase D)",
-            source_rate_initial,
+            "MODO FLUX: source_rate_initial=%.4e n/s (informativo), flux=%s n/cm²/s prescrito",
+            source_rate_initial, flux,
         )
 
         # ── openmc.Settings ───────────────────────────────────────────────
@@ -411,10 +406,9 @@ class SettingsBuilder:
         # Posições temporais absolutas em horas (para eixo X de gráficos/output)
         output_times_h = self._output_times_h(dt_output_h, total_h)
 
-        # ── Source rate por passo — ATENÇÃO V238 ───────────────────────────────
-        # FIX V238: source_rates aqui é APENAS estimativa inicial.
-        # O valor calibrado será determinado em simulation.py via SourceCalibrator.
-        # Esta lista será SUBSTITUÍDA pelo valor calibrado antes da depleção.
+        # ── Source rate por passo — MODO FLUX V242 ───────────────────────────────
+        # FIX V242: No modo FLUX, source_rates é informativo. O IndependentOperator
+        # usa fluxes_list = [flux] * n_materiais diretamente, sem calibração.
         source_rates_initial = [source_rate_initial] * n_steps
 
         # ── Energia da fonte ──────────────────────────────────────────────
@@ -450,7 +444,7 @@ class SettingsBuilder:
                 # os sub-passos de 6h calculados pelo DepletionAutoTuner.
                 # 'timesteps_internos_s' contém as durações reais do integrador (6h cada).
                 "timesteps_internos_s": timesteps_s if use_substeps else None,
-                "source_rates":     source_rates_initial,  # Será substituído após calibração
+                "source_rates":     source_rates_initial,  # Informativo no modo FLUX
                 "use_substeps":     use_substeps,
                 "n_substeps":       dep_params.n_substeps,
                 "auto_tune_band":   dep_params.band,
@@ -472,13 +466,13 @@ class SettingsBuilder:
             "data_manager": ChainDataProxy(chain_path=chain_path, xs_path=xs_path),
 
             "source_params": {
-                "strength":      source_rate_initial,  # Estimativa inicial, será calibrado
-                "source_rates":  source_rates_initial,  # Será substituído após calibração
-                "energy_ev":     energy_ev   if _OPENMC_OK else None,
-                "energy_type":   energy_type if _OPENMC_OK else None,
-                "flux_n_cm2_s":  flux,
-                "wafer_area_cm2": area,
-                "calibration_required": True,  # V238: indica que calibração deve ser executada
+                "strength":           source_rate_initial,  # Informativo no modo FLUX
+                "source_rates":       source_rates_initial,  # Informativo no modo FLUX
+                "energy_ev":          energy_ev   if _OPENMC_OK else None,
+                "energy_type":        energy_type if _OPENMC_OK else None,
+                "flux_n_cm2_s":       flux,
+                "wafer_area_cm2":     area,
+                "calibration_required": False,  # V242: modo FLUX não usa calibração
             },
 
             "simulation_mode": sim_mode,

@@ -1,42 +1,42 @@
 ```
-# Compiled and binary files
+# Compiled Python files
 *.pyc
 __pycache__/
 
-# Dependencies
-.venv/
+# Virtual environments
 venv/
-pip-log.txt
-pipenv.lock
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-*.swo
-
-# Environment
+.venv/
 .env
 .env.local
 *.env.*
 
-# Editors
-.vscode/
-.idea/
-*.sublime-project
-*.sublime-workspace
-
-# OS generated files
-.DS_Store
-Thumbs.db
+# Logs
+*.log
 
 # Coverage reports
 .coverage
 coverage/
 htmlcov/
 
-# Distribution / packaging
-dist/
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# Build artifacts
 build/
-*.egg-info/
+dist/
+*.so
+*.dylib
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.mypy_cache/
 ```
