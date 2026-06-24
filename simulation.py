@@ -378,14 +378,8 @@ class SimulationRunner:
         flux_target = float(self.sp.get("flux", self.sp.get("fluxo", 2e14)))
         self.logger.info("FLUXO NOMINAL DO REATOR: %.4e n/cm²/s", flux_target)
         
-        # Fluxo por material depletável (todos recebem o mesmo fluxo de reator)
-        n_mats_depletable = sum(1 for m in self.materials if getattr(m, 'depletable', True))
-        fluxes_list = [flux_target] * max(1, n_mats_depletable)
-        
-        self.logger.info(
-            "fluxes_list criado com %d materiais depletáveis @ %.4e n/cm²/s cada",
-            len(fluxes_list), flux_target
-        )
+        # NOTA: fluxes_list será recalculado por get_microxs_and_flux() abaixo
+        # Esta variável é apenas informativa para logging inicial
 
         try:
             model = self._build_model()
@@ -398,32 +392,62 @@ class SimulationRunner:
             return self._fail("Chain file não encontrado")
 
         # ──────────────────────────────────────────────────────────────────────
-        # FIX V242: IndependentOperator no modo FLUX
+        # FIX V246: IndependentOperator no modo FLUX — Implementação corrigida
         # ──────────────────────────────────────────────────────────────────────
-        # OpenMC 0.15.3: IndependentOperator(materials, fluxes, chain_file, normalization_mode)
-        #   - fluxes: lista de [n/cm²/s] POR MATERIAL (não por timestep)
-        #   - normalization_mode="flux" usa fluxes diretamente
+        # Problema detectado: O código anterior tentava usar normalization_mode,
+        # que NÃO existe na API do OpenMC 0.15.3.
         #
-        # O operador calcula MicroXS uma vez com espectro real e o integrador
-        # resolve Bateman analiticamente com phi = flux_target.
+        # Solução V246 (OpenMC 0.15.3):
+        #   1. Usar get_microxs_and_flux() para calcular MicroXS e fluxo real
+        #   2. Passar fluxes E micros para IndependentOperator
+        #   3. Usar source_rates no integrador para controlar ativação/decaimento
+        #
+        # Assinatura correta (OpenMC 0.15.3):
+        #   fluxes, micros = get_microxs_and_flux(model, domains, energies=...)
+        #   op = IndependentOperator(materials, fluxes, micros, chain_file)
+        #   integrator = CELIIntegrator(op, timesteps, source_rates=[sr1, sr2, ...])
         # ──────────────────────────────────────────────────────────────────────
         
         try:
-            op = openmc.deplete.IndependentOperator(
-                openmc.Materials(self.materials),
-                fluxes_list,  # [n/cm²/s] por material depletável
-                chain_file=str(chain),
-                normalization_mode="flux",
+            # Obter domínios (materiais depletáveis) para cálculo de MicroXS
+            depletable_materials = [m for m in self.materials if getattr(m, 'depletable', True)]
+            if not depletable_materials:
+                depletable_materials = self.materials
+            
+            self.logger.info("Calculando microscopic cross sections para %d materiais...", 
+                           len(depletable_materials))
+            
+            # Calcular fluxo e cross sections microscópicas usando transporte OpenMC
+            # energies=None → sem filtro de energia (one-group)
+            fluxes_list, micros_list = openmc.deplete.get_microxs_and_flux(
+                model=model,
+                domains=depletable_materials,
+                energies=None,  # One-group
+                chain_file=str(chain)
             )
+            
+            self.logger.info("MicroXS calculadas com sucesso: %d grupos de energia",
+                           len(micros_list[0].energies) - 1 if len(micros_list) > 0 else 0)
+            
+            # Criar IndependentOperator com fluxes E micros
+            # NOTA: IndependentOperator em 0.15.3 usa fluxes+micros diretamente
+            # para calcular reaction rates internamente
+            op = openmc.deplete.IndependentOperator(
+                materials=openmc.Materials(depletable_materials),
+                fluxes=fluxes_list,
+                micros=micros_list,
+                chain_file=str(chain),
+            )
+            self.logger.info("IndependentOperator criado com fluxes=%.4e n/cm²/s", flux_target)
         except Exception as exc:
             self.logger.warning(
-                "IndependentOperator(mode='flux') falhou: %s — tentando fallback",
+                "IndependentOperator falhou: %s — tentando fallback para CoupledOperator",
                 exc
             )
             # Fallback para CoupledOperator se IndependentOperator não disponível
             try:
                 op = openmc.deplete.CoupledOperator(
-                    model=model, chain_file=str(chain), normalization_mode="flux"
+                    model=model, chain_file=str(chain)
                 )
             except Exception as exc2:
                 return self._fail(f"Operador de depleção falhou: {exc2}")
@@ -804,10 +828,14 @@ class SimulationRunner:
 
     def _build_integrator_flux(self, operator, dt_s: np.ndarray, flux: float):
         """
-        FIX V242: Integrador para modo FLUX — usa fluxes em vez de source_rates.
+        FIX V246: Integrador para modo FLUX — usa source_rates para controlar ativação/decaimento.
         
-        No modo flux, o IndependentOperator já recebeu fluxes no construtor.
-        O integrador apenas resolve Bateman com phi constante.
+        No modo flux, o IndependentOperator já recebeu fluxes+micros no construtor.
+        O integrador usa source_rates para definir quando a fonte está ligada (ativação)
+        ou desligada (decaimento puro).
+        
+        Quando source_rate > 0: ativação com fluxo
+        Quando source_rate = 0: decaimento puro (sem ativação)
         """
         name_requested = (
             self.sp.get("_depletion_integrator")
@@ -832,16 +860,22 @@ class SimulationRunner:
             IntClass = getattr(openmc.deplete, "CELIIntegrator",
                                openmc.deplete.PredictorIntegrator)
         
+        # Criar source_rates: mesmo valor para todos os passos (fonte sempre ligada)
+        # Para cenários com desligamento, usar [sr1, sr2, 0.0, 0.0, ...]
+        source_rate = self.sp.get("source_rate_initial", 1e15)
+        src_rates = [source_rate] * len(dt_s)
+        
         self.logger.info(
-            "Integrador FLUX: %s (n_passos=%d, flux=%.4e n/cm²/s)",
-            cls_name, len(dt_s), flux
+            "Integrador FLUX: %s (n_passos=%d, flux=%.4e n/cm²/s, source_rate=%.4e n/s)",
+            cls_name, len(dt_s), flux, source_rate
         )
         
-        # No modo flux, não passamos source_rates — o operador já tem fluxes
+        # Passar source_rates para controlar ativação vs decaimento
         return IntClass(
             operator=operator,
             timesteps=dt_s,
             timestep_units="s",
+            source_rates=src_rates,
         )
 
     # ── Timesteps ─────────────────────────────────────────────────────────────
@@ -869,7 +903,7 @@ class SimulationRunner:
         n = max(1, round(float(self.sp.get("total_time_h", 48.0)) / dt_h))
         return [dt_h * 3600.0] * n
 
-    def _safe_timesteps(self, source_rate: float) -> np.ndarray:
+    def _safe_timesteps(self, flux: float) -> np.ndarray:
         """
         FIX V237.3: Padronização de timesteps — contrato temporal unificado.
         
@@ -916,7 +950,7 @@ class SimulationRunner:
         if n_u235 <= 0.0:
             return dt_s
 
-        flux   = float(self.sp.get("flux", self.sp.get("fluxo", 1e13)))
+        # Usar fluxo passado como parâmetro (não buscar de self.sp novamente)
         burn_s = flux * _SIG_U235
         dt_max = _MAX_BURNUP / burn_s if burn_s > 0 else 1e9
         if dt_max < 1.0:
