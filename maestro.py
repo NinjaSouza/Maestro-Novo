@@ -670,7 +670,7 @@ class MaestroV237:
         # O IndependentOperator usa fluxes_list = [flux] * n_materiais
         if src_params and "strength" in src_params:
             _spar["source_rate"] = src_params["strength"]
-            self.logger.info(
+            logger.info(
                 "MODO FLUX: source_rate=%.4e n/s (informativo), flux prescrito por material",
                 src_params["strength"],
             )
