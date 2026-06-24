@@ -189,16 +189,49 @@ class SimulationRunner:
         #   - Modela fisicamente campo de reator (não feixe plano)
         # ──────────────────────────────────────────────────────────────────────
         
+        # ──────────────────────────────────────────────────────────────────────
+        # FIX V243: IndependentOperator com API correta para OpenMC 0.15.3
+        # ──────────────────────────────────────────────────────────────────────
+        # OpenMC 0.15.3 NÃO suporta normalization_mode="flux"
+        # Modos disponíveis: 'energy-deposition', 'fission-q', 'source-rate'
+        #
+        # Solução: Usar normalization_mode="source-rate" com source_rates
+        # calculados corretamente como flux × volume por material.
+        # 
+        # Para cada material depletável:
+        #   source_rate_i = flux_target × volume_i [n/s]
+        #
+        # Isso preserva a física do fluxo nominal sem precisar de calibração.
+        # ──────────────────────────────────────────────────────────────────────
+        
         flux_target = float(self.sp.get("flux", self.sp.get("fluxo", 2e14)))
         self.logger.info("FLUXO NOMINAL DO REATOR: %.4e n/cm²/s", flux_target)
         
-        # Fluxo por material depletável (todos recebem o mesmo fluxo de reator)
-        n_mats_depletable = sum(1 for m in self.materials if getattr(m, 'depletable', True))
-        fluxes_list = [flux_target] * max(1, n_mats_depletable)
+        # Calcular source_rates por material como flux × volume
+        source_rates_list = []
+        for mat in self.materials:
+            if getattr(mat, 'depletable', True):
+                vol = getattr(mat, 'volume', None)
+                if vol is None or vol <= 0:
+                    # Estimar volume se não definido
+                    vol = 1.0  # fallback
+                    self.logger.warning(
+                        "Material %s sem volume definido; usando volume=1.0 cm³",
+                        mat.name or mat.id
+                    )
+                sr = flux_target * vol  # [n/s]
+                source_rates_list.append(sr)
+                self.logger.debug(
+                    "Material %s: volume=%.4e cm³, source_rate=%.4e n/s",
+                    mat.name or mat.id, vol, sr
+                )
+        
+        if len(source_rates_list) == 0:
+            return self._fail("Nenhum material depletável encontrado")
         
         self.logger.info(
-            "fluxes_list criado com %d materiais depletáveis @ %.4e n/cm²/s cada",
-            len(fluxes_list), flux_target
+            "source_rates_list criado com %d materiais @ flux=%.4e n/cm²/s",
+            len(source_rates_list), flux_target
         )
 
         try:
@@ -211,34 +244,25 @@ class SimulationRunner:
         if not chain:
             return self._fail("Chain file não encontrado")
 
-        # ──────────────────────────────────────────────────────────────────────
-        # FIX V242: IndependentOperator no modo FLUX
-        # ──────────────────────────────────────────────────────────────────────
-        # OpenMC 0.15.3: IndependentOperator(materials, fluxes, chain_file, normalization_mode)
-        #   - fluxes: lista de [n/cm²/s] POR MATERIAL (não por timestep)
-        #   - normalization_mode="flux" usa fluxes diretamente
-        #
-        # O operador calcula MicroXS uma vez com espectro real e o integrador
-        # resolve Bateman analiticamente com phi = flux_target.
-        # ──────────────────────────────────────────────────────────────────────
-        
         try:
             op = openmc.deplete.IndependentOperator(
                 openmc.Materials(self.materials),
-                fluxes_list,  # [n/cm²/s] por material depletável
+                source_rates_list,  # [n/s] por material depletável
                 chain_file=str(chain),
-                normalization_mode="flux",
+                normalization_mode="source-rate",
             )
+            self.logger.info("IndependentOperator criado com normalization_mode='source-rate'")
         except Exception as exc:
             self.logger.warning(
-                "IndependentOperator(mode='flux') falhou: %s — tentando fallback",
+                "IndependentOperator falhou: %s — tentando fallback para CoupledOperator",
                 exc
             )
             # Fallback para CoupledOperator se IndependentOperator não disponível
             try:
                 op = openmc.deplete.CoupledOperator(
-                    model=model, chain_file=str(chain), normalization_mode="flux"
+                    model=model, chain_file=str(chain), normalization_mode="source-rate"
                 )
+                self.logger.info("CoupledOperator criado como fallback")
             except Exception as exc2:
                 return self._fail(f"Operador de depleção falhou: {exc2}")
 
