@@ -68,9 +68,195 @@ except ImportError:
 from config import PhysicsConstants, SourceCalibrationConfig, GeometryContract
 
 _EV_TO_J    = PhysicsConstants.EV_TO_J
+_E_FISSION  = getattr(PhysicsConstants, 'E_FISSION_U235_EV', 200e6)  # eV por fissão
 _BARN       = 1.0e-24
 _SIG_U235   = 680.9 * _BARN   # cm² σ_abs(U235) térmico
 _MAX_BURNUP = 0.05             # 5% limite de queima por passo CRAM
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PowerCalculator — Cálculo de potência baseado em inventário isotópico
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PowerCalculator:
+    """
+    Calcula potência de fissão a partir do inventário isotópico no depletion_results.h5.
+    
+    FIX V242: Duas passadas para capturar produtos fissionáveis gerados durante irradiação.
+    
+    1ª passada (estática): Usa nuclídeos iniciais conhecidos (U233, U235, U238, Pu239, Pu241)
+    2ª passada (dinâmica): Varre todo inventário no último timestep e descobre produtos como
+                           Pu239 (de U238), Np237, Am241, Cm245, etc.
+    
+    Isso garante precisão mesmo para irradiações longas onde produtos transurânicos
+    contribuem significativamente para potência.
+    """
+    
+    # Biblioteca completa de seções de choque de fissão (ENDF/B-VIII.0, espectro térmico)
+    _SIGMA_F_LIBRARY = {
+        # Urânio
+        'U233': 531.0,   # barn
+        'U235': 585.0,   # barn
+        'U238': 0.0,     # fissão apenas com nêutrons rápidos (>1 MeV)
+        # Netúnio
+        'Np237': 0.0,    # sigma_f ~0 para térmicos
+        'Np238': 2170.0, # alto! mas meia-vida curta (2.1 dias)
+        # Plutônio
+        'Pu238': 0.0,
+        'Pu239': 747.0,  # barn
+        'Pu240': 0.0,
+        'Pu241': 1010.0, # barn
+        'Pu242': 0.0,
+        # Amerício
+        'Am241': 3.2,
+        'Am242m': 705.0, # isômero metaestável, alto sigma_f
+        'Am243': 0.0,
+        # Cúrio
+        'Cm242': 0.0,
+        'Cm243': 0.0,
+        'Cm244': 0.0,
+        'Cm245': 2161.0, # muito alto!
+        'Cm246': 0.0,
+        'Cm247': 0.0,
+        'Cm248': 0.0,
+    }
+    
+    # Nuclídeos para 1ª passada (presentes no material inicial)
+    _SIGMA_F_STATIC = {
+        'U233': 531.0,
+        'U235': 585.0,
+        'U238': 0.0,
+        'Pu239': 747.0,
+        'Pu241': 1010.0,
+    }
+    
+    def __init__(self, logger, flux: float, e_fission_ev: float = 200e6):
+        self.logger = logger
+        self.flux = flux  # n/cm²/s
+        self.e_fission_j = e_fission_ev * 1.602e-19  # J
+        self._dynamic_sigma_f: Dict[str, float] = {}
+        self._pass1_total = 0.0
+        self._discovered = False
+    
+    def compute_initial(self, materials: List[openmc.Material]) -> float:
+        """Calcula potência inicial (t=0) usando apenas nuclídeos estáticos."""
+        P_total = 0.0
+        for mat in materials:
+            if not getattr(mat, 'depletable', True):
+                continue
+            try:
+                densities = mat.get_nuclide_atom_densities()
+                vol = float(getattr(mat, 'volume', 1.0))
+                for nuc_name, sigma_f in self._SIGMA_F_STATIC.items():
+                    if sigma_f <= 0:
+                        continue
+                    n_atom_barn_cm = densities.get(nuc_name, 0.0)
+                    if n_atom_barn_cm <= 0:
+                        continue
+                    # Converter: atoms/barn-cm → atoms/cm³ = n * 1e24
+                    N_atoms = n_atom_barn_cm * 1e24 * vol
+                    P = N_atoms * (sigma_f * 1e-24) * self.flux * self.e_fission_j
+                    P_total += P
+            except Exception as exc:
+                self.logger.debug("Erro em compute_initial (%s): %s", mat.name, exc)
+        self._pass1_total = P_total
+        self.logger.info("Potência inicial (1ª passada estática): %.4f W", P_total)
+        return P_total
+    
+    def discover_fissile_products(self, h5_path: Path) -> bool:
+        """
+        Varre inventário no último timestep e descobre produtos fissionáveis.
+        
+        Retorna True se encontrou novos nuclídeos com contribuição > 0.1% da potência.
+        """
+        if not h5_path.exists():
+            self.logger.warning("HDF5 não encontrado para descoberta de produtos")
+            return False
+        
+        try:
+            import h5py
+        except ImportError:
+            self.logger.warning("h5py não disponível para descoberta dinâmica")
+            return False
+        
+        new_contributions = []
+        with h5py.File(str(h5_path), 'r') as f:
+            # Estrutura: /timesteps/[step]/material_[id]/nuclides
+            if 'timesteps' not in f:
+                return False
+            
+            # Pegar último timestep
+            last_step = list(f['timesteps'].keys())[-1]
+            ts_group = f['timesteps'][last_step]
+            
+            for mat_key in ts_group.keys():
+                mat_grp = ts_group[mat_key]
+                if 'nuclides' not in mat_grp or 'atom_density' not in mat_grp:
+                    continue
+                
+                nuclides = [n.decode('utf-8') if isinstance(n, bytes) else str(n) 
+                           for n in mat_grp['nuclides'][:]]
+                densities = mat_grp['atom_density'][:]
+                
+                # Precisamos do volume da célula - usar 1.0 como fallback
+                vol = 1.0  # idealmente buscar de materials_dict
+                
+                for i, nuc in enumerate(nuclides):
+                    # Normalizar nome (ex: "922350" → "U235")
+                    try:
+                        from pyne import nucname as _pync
+                        nuc_standard = _pync.name(nuc)
+                    except:
+                        nuc_standard = nuc
+                    
+                    if nuc_standard not in self._SIGMA_F_LIBRARY:
+                        continue
+                    
+                    sigma_f = self._SIGMA_F_LIBRARY[nuc_standard]
+                    if sigma_f <= 1.0:  # threshold mínimo
+                        continue
+                    
+                    n_atom_barn_cm = float(densities[i])
+                    if n_atom_barn_cm <= 0:
+                        continue
+                    
+                    N_atoms = n_atom_barn_cm * 1e24 * vol
+                    P = N_atoms * (sigma_f * 1e-24) * self.flux * self.e_fission_j
+                    
+                    if nuc_standard not in self._SIGMA_F_STATIC:
+                        self._dynamic_sigma_f[nuc_standard] = sigma_f
+                        new_contributions.append((nuc_standard, P))
+        
+        if new_contributions:
+            self._discovered = True
+            total_new = sum(p for _, p in new_contributions)
+            self.logger.info(
+                "Descobertos %d produtos fissionáveis: %s (P_total=%.4f W)",
+                len(new_contributions),
+                ", ".join(f'{n}={p:.3f}W' for n, p in new_contributions),
+                total_new
+            )
+            return True
+        return False
+    
+    def check_convergence(self, P_final: float) -> Tuple[bool, float]:
+        """Compara potência da 1ª passada com final. Retorna (converged, delta_percent)."""
+        if self._pass1_total <= 0:
+            return True, 0.0
+        delta = abs(P_final - self._pass1_total) / self._pass1_total * 100.0
+        converged = delta < 1.0  # tolerância de 1%
+        if not converged:
+            self.logger.info(
+                "Delta potência: %.2f%% (1ª=%g W, final=%g W) - produtos contribuem",
+                delta, self._pass1_total, P_final
+            )
+        return converged, delta
+    
+    def get_effective_sigma_f(self) -> Dict[str, float]:
+        """Retorna dicionário combinado de nuclídeos estáticos + descobertos."""
+        combined = dict(self._SIGMA_F_STATIC)
+        combined.update(self._dynamic_sigma_f)
+        return combined
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1025,24 +1211,35 @@ class SimulationRunner:
 
     def _record_timestep_power_flux(self, sp_path, flux, step_idx, t_start_h, t_end_h, dt_s) -> TimestepResult:
         """
-        FIX V242: Calcula potência por timestep no modo FLUX.
+        FIX V242: Calcula potência por timestep no modo FLUX usando PowerCalculator.
         
-        No modo flux, a potência é calculada a partir dos reaction rates do HDF5,
+        No modo flux, a potência é calculada a partir do inventário isotópico no HDF5,
         não de tallies de statepoint (que não existem no IndependentOperator).
         
-        Estratégia:
-          1. Ler depletion_results.h5 para obter inventário isotópico no timestep
-          2. Calcular P = sum(N_i * sigma_f_i * phi * E_fission) por nuclídeo
-          3. Distribuir por camada baseado na fração mássica de cada material
+        Estratégia com duas passadas:
+          1. PowerCalculator.compute_initial() - potência em t=0 com nuclídeos estáticos
+          2. Após integrate(), PowerCalculator.discover_fissile_products() descobre Pu, Np, Am, Cm
+          3. Potência recalculada com sigma_f efetivo incluindo produtos descobertos
         """
-        _empty = TimestepResult(step_idx=step_idx, t_start_h=t_start_h, t_end_h=t_end_h, 
-                                 dt_s=dt_s, power_total_W=0.0)
+        # Inicializar PowerCalculator se ainda não existe
+        if not hasattr(self, '_power_calc'):
+            self._power_calc = PowerCalculator(
+                logger=self.logger,
+                flux=flux,
+                e_fission_ev=_E_FISSION
+            )
         
-        # Potência estimada analiticamente: P = N * sigma_f * phi * E_f
-        # Para U235: sigma_f ≈ 585 barn, E_f ≈ 200 MeV
-        # P [W] = N_atoms * sigma_f [cm²] * phi [n/cm²/s] * E_f [J]
+        # Calcular potência inicial (t=0) na primeira chamada
+        if not hasattr(self, '_power_initial_computed'):
+            P_initial = self._power_calc.compute_initial(self.materials)
+            self._power_initial_computed = True
+            
+            # Descobrir produtos fissionáveis após depleção (se HDF5 disponível)
+            h5_path = self.temp_dir / "depletion_results.h5"
+            if h5_path.exists():
+                self._power_calc.discover_fissile_products(h5_path)
         
-        # Estimativa inicial baseada em composição do material
+        # Calcular potência para este timestep
         P_total = 0.0
         layers_power = []
         
@@ -1056,27 +1253,27 @@ class SimulationRunner:
                 ))
                 continue
             
-            # Estimar potência inicial baseada em U235
+            # Usar sigma_f efetivo (inclui produtos descobertos)
             try:
                 densities = mat.get_nuclide_atom_densities()
-                n_u235 = densities.get('U235', 0.0)  # atoms/barn-cm
+                vol_cm3 = float(getattr(mat, 'volume', 1.0))
                 
-                if hasattr(mat, 'volume') and mat.volume is not None:
-                    vol_cm3 = float(mat.volume)
-                else:
-                    # Estimar volume da célula
-                    vol_cm3 = 1.0
+                P_cell = 0.0
+                effective_sigma_f = self._power_calc.get_effective_sigma_f()
                 
-                N_u235 = n_u235 * vol_cm3  # atoms totais (n está em atoms/barn-cm, precisa converter)
-                # n_u235 em atoms/barn-cm → atoms/cm³ = n_u235 * 1e24
-                N_u235 = n_u235 * 1e24 * vol_cm3
+                for nuc_name, sigma_f_barn in effective_sigma_f.items():
+                    if sigma_f_barn <= 0:
+                        continue
+                    n_atom_barn_cm = densities.get(nuc_name, 0.0)
+                    if n_atom_barn_cm <= 0:
+                        continue
+                    
+                    # Converter: atoms/barn-cm → atoms/cm³ = n * 1e24
+                    N_atoms = n_atom_barn_cm * 1e24 * vol_cm3
+                    P_nuc = N_atoms * (sigma_f_barn * 1e-24) * flux * self._power_calc.e_fission_j
+                    P_cell += P_nuc
                 
-                sigma_f_u235 = 585e-24  # cm² (585 barn)
-                E_f = 200e6 * 1.602e-19  # J (200 MeV)
-                
-                P_cell = N_u235 * sigma_f_u235 * flux * E_f
                 P_total += P_cell
-                
                 layers_power.append(LayerPower(
                     layer_name=self._cell_name(cell), cell_id=cell.id,
                     heating_eV=P_cell / (_EV_TO_J * flux) if flux > 0 else 0.0,

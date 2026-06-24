@@ -144,15 +144,11 @@ class PipelineAudit:
     depletion_normalization: str = ""
     chain_file:              str = ""
     dt_depletion_h:          float = 0.0
-    # V238: campos de rastreabilidade de calibração da fonte
-    flux_target:             float = 0.0
-    flux_achieved:           float = 0.0
-    source_rate_initial:     float = 0.0
-    source_rate_calibrated:  float = 0.0
-    calibration_required:    bool  = True
-    calibration_iterations:  int   = 0
-    calibration_converged:   bool  = False
-    tally_used:              str   = ""
+    # V238/V242: campos de rastreabilidade de fluxo e modo de operação
+    flux_nominal:              float = 0.0
+    n_dep_materials:           int   = 0
+    source_rate_initial:       float = 0.0
+    calibration_required:      bool  = False  # V242: False no modo FLUX
 
     def to_json(self, filepath: str) -> None:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -454,20 +450,17 @@ class MaestroV237:
                 tp.get("dt_depletion_h", SimulationDefaults.DT_H_DEPLETION)
             )
             
-            # V238: Registrar parâmetros de calibração da fonte
-            self.audit.flux_target             = float(src.get("flux_n_cm2_s", 0))
-            self.audit.source_rate_initial     = float(src.get("strength", 0))
-            self.audit.calibration_required    = src.get("calibration_required", True)
+            # V242: Registrar parâmetros de fluxo nominal (modo FLUX)
+            self.audit.flux_nominal              = float(src.get("flux_n_cm2_s", 0))
+            self.audit.source_rate_initial       = float(src.get("strength", 0))
+            self.audit.calibration_required      = src.get("calibration_required", False)
             
-            # FIX FASE 2: Persistir source_rate calibrado em settings_result e system_params
-            # Isso garante que o valor calibrado seja usado consistentemente em todo o pipeline
-            if "source_rate" in src and src["source_rate"] > 0:
-                # Atualizar settings_result com source_rate calibrado
-                context["settings_result"]["source_params"]["source_rate_calibrated"] = src["source_rate"]
-                # Também atualizar depletion_params se existir
-                dep = context["settings_result"].get("depletion_params", {})
-                if dep:
-                    dep["_source_rate_calibrated"] = src["source_rate"]
+            # MODO FLUX: não há calibração, fluxo prescrito diretamente
+            logger.info(
+                "  MODO FLUX: flux_nominal=%.4e n/cm²/s, calibration_required=%s",
+                self.audit.flux_nominal,
+                "NÃO" if not self.audit.calibration_required else "SIM",
+            )
 
             # ── D: Simulation ────────────────────────────────────────────────
             logger.info("PHASE D — SIMULATION")
@@ -481,20 +474,8 @@ class MaestroV237:
                                               error=r.get("error", "Phase D falhou"))
             context["simulation_result"] = r
             
-            # V238: Extrair resultados da calibração da fonte
-            sim_result = r
-            calib_result = sim_result.get("_calibration_result", {})
-            if calib_result:
-                self.audit.flux_achieved           = float(calib_result.get("flux_achieved_n_cm2_s", 0))
-                self.audit.source_rate_calibrated  = float(calib_result.get("source_rate_calibrated_n_s", 0))
-                self.audit.calibration_iterations  = int(calib_result.get("n_iterations", 0))
-                self.audit.calibration_converged   = bool(calib_result.get("converged", False))
-                logger.info(
-                    "  Calibração: flux_target=%.4e → flux_achieved=%.4e (%d iterações, converged=%s)",
-                    self.audit.flux_target, self.audit.flux_achieved,
-                    self.audit.calibration_iterations,
-                    "SIM" if self.audit.calibration_converged else "NÃO",
-                )
+            # V242: Modo FLUX não usa calibração - remover bloco de extração
+            # O fluxo nominal é prescrito diretamente no IndependentOperator
             
             pw = r.get("power_distribution", {})
             logger.info(
@@ -685,16 +666,14 @@ class MaestroV237:
             _spar["_source_rates"]            = dep.get("source_rates", [])
             _spar["_timesteps_s"]             = dep.get("timesteps_s", [])
         
-        # FIX V239 FASE 2: Priorizar source_rate_calibrated se disponível
-        # A calibração em simulation.py pode ter ajustado o valor inicial
-        if src_params and "source_rate_calibrated" in src_params and src_params["source_rate_calibrated"] > 0:
-            _spar["source_rate"] = src_params["source_rate_calibrated"]
-            self.logger.info(
-                "Usando source_rate_calibrated=%.4e n/s (após calibração)",
-                src_params["source_rate_calibrated"],
-            )
-        elif src_params and "strength" in src_params:
+        # V242: MODO FLUX - fluxo prescrito diretamente, sem calibração
+        # O IndependentOperator usa fluxes_list = [flux] * n_materiais
+        if src_params and "strength" in src_params:
             _spar["source_rate"] = src_params["strength"]
+            self.logger.info(
+                "MODO FLUX: source_rate=%.4e n/s (informativo), flux prescrito por material",
+                src_params["strength"],
+            )
         elif dep and "source_rates" in dep and dep["source_rates"]:
             # Se não tem 'strength', usa o primeiro da lista source_rates
             _spar["source_rate"] = dep["source_rates"][0]

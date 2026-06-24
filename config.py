@@ -53,6 +53,7 @@ class PhysicsConstants:
     KB_EV:   float = 8.617_333_262e-5    # eV/K  (kB em eV)
     LN2:     float = 0.693_147_180_559_945_3  # ln(2)
     SECONDS_PER_HOUR: float = 3600.0     # s/h — evita magic number nas conversões
+    E_FISSION_U235_EV: float = 200e6     # energia média por fissão de U-235 [eV]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -124,7 +125,8 @@ class SourceCalibrationConfig:
     Algoritmo: sr_novo = sr_velho × (fluxo_alvo / fluxomedido)
     """
     # Habilitar calibração automática da fonte
-    ENABLE_CALIBRATION: bool = True
+    # DESATIVADO no modo FLUX - calibração não é necessária
+    ENABLE_CALIBRATION: bool = False
     
     # Tolerância relativa para convergência do fluxo calibrado
     # Ex: 0.02 = 2% de tolerância
@@ -405,8 +407,12 @@ class SimulationDefaults:
 
     # ── Depleção (valores fallback; DepletionAutoTuner sobrescreve) ──────────
     DEPLETION_INTEGRATOR:     str  = "celi"         # CE/LI — padrão para Mo99
-    DEPLETION_NORMALIZATION:  str  = "source-rate"  # normalização por fluxo
+    DEPLETION_NORMALIZATION:  str  = "flux"         # modo FLUX para reator - fluxo prescrito por material
     DEPLETION_SUBSTEPS:       int  = 2              # sub-passos por DT_H_OUTPUT
+    
+    # ── Física nuclear ────────────────────────────────────────────────────────
+    # Energia média liberada por fissão de U-235 [eV] - usado para cálculo de potência
+    E_FISSION_U235_EV: float = 200e6
 
     # ── Monte Carlo ─────────────────────────────────────────────────────────
     FLUX:           float = 1e13      # fluxo de nêutrons [n/cm²/s]
