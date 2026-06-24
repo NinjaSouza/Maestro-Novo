@@ -657,6 +657,7 @@ class MaestroV237:
             _spar["wafer_y_cm"] = _wg.get("y_cm", 1.69)
 
         # FIX V235/V236: injetar depletion_params e source_rate em system_params
+        # V246: MODO FLUX — usar 'strength' de source_params ou primeiro source_rates
         dep = settings_result.get("depletion_params", {})
         src_params = settings_result.get("source_params", {})
         
@@ -666,17 +667,18 @@ class MaestroV237:
             _spar["_source_rates"]            = dep.get("source_rates", [])
             _spar["_timesteps_s"]             = dep.get("timesteps_s", [])
         
-        # V242: MODO FLUX - fluxo prescrito diretamente, sem calibração
-        # O IndependentOperator usa fluxes_list = [flux] * n_materiais
+        # V246: MODO FLUX - fluxo prescrito diretamente, sem calibração
+        # O IndependentOperator usa fluxes+micros calculados por get_microxs_and_flux()
+        # source_rate é usado no integrador para controlar ativação vs decaimento
         if src_params and "strength" in src_params:
-            _spar["source_rate"] = src_params["strength"]
+            _spar["source_rate_initial"] = src_params["strength"]
             logger.info(
-                "MODO FLUX: source_rate=%.4e n/s (informativo), flux prescrito por material",
+                "MODO FLUX: source_rate_initial=%.4e n/s (informativo), flux prescrito por material",
                 src_params["strength"],
             )
         elif dep and "source_rates" in dep and dep["source_rates"]:
             # Se não tem 'strength', usa o primeiro da lista source_rates
-            _spar["source_rate"] = dep["source_rates"][0]
+            _spar["source_rate_initial"] = dep["source_rates"][0]
         
         # FIX FASE 2: Injetar geometry_result em system_params para acesso em simulation.py
         _spar["_geometry_result"] = geo_result
