@@ -1,4 +1,42 @@
 ```
-__pycache__/
+# Compiled and binary files
 *.pyc
+__pycache__/
+
+# Dependencies
+.venv/
+venv/
+pip-log.txt
+pipenv.lock
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
 ```

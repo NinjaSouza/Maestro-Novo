@@ -637,6 +637,7 @@ class GeometryBuilder:
                 +z_ext_bot & -z_wafer_bot
             ),
         )
+        water_front.volume = (x_cm + 2*dlat) * (y_cm + 2*dlat) * dax
         cells_dict["water_front"] = water_front
 
         water_back = openmc.Cell(
@@ -648,6 +649,7 @@ class GeometryBuilder:
                 +z_wafer_top & -z_ext_top
             ),
         )
+        water_back.volume = (x_cm + 2*dlat) * (y_cm + 2*dlat) * dax
         cells_dict["water_back"] = water_back
 
         water_lateral = openmc.Cell(
@@ -660,6 +662,7 @@ class GeometryBuilder:
                 ~wafer_xy
             ),
         )
+        water_lateral.volume = ((x_cm + 2*dlat) * (y_cm + 2*dlat) - x_cm * y_cm) * total_wafer_cm
         cells_dict["water_lateral"] = water_lateral
 
         universe = openmc.Universe(cells=list(cells_dict.values()))
