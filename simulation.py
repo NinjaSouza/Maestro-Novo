@@ -245,26 +245,67 @@ class SimulationRunner:
             return self._fail("Chain file não encontrado")
 
         try:
-            op = openmc.deplete.IndependentOperator(
-                openmc.Materials(self.materials),
-                source_rates_list,  # [n/s] por material depletável
+            # FIX V243: IndependentOperator com API correta para OpenMC 0.15+
+            # Em OpenMC 0.15+, o construtor direto exige micros como argumento posicional.
+            # Usamos from_nuclides() que é o método recomendado e mais robusto.
+            op = openmc.deplete.IndependentOperator.from_nuclides(
+                materials=openmc.Materials(self.materials),
                 chain_file=str(chain),
                 normalization_mode="source-rate",
+                source_rates=source_rates_list,  # [n/s] por material depletável
             )
-            self.logger.info("IndependentOperator criado com normalization_mode='source-rate'")
+            self.logger.info("IndependentOperator.from_nuclides() criado com normalization_mode='source-rate'")
+        except AttributeError:
+            # Fallback para versões antigas que não têm from_nuclides
+            try:
+                op = openmc.deplete.IndependentOperator(
+                    openmc.Materials(self.materials),
+                    None,  # micros=None — será calculado internamente
+                    chain_file=str(chain),
+                    normalization_mode="source-rate",
+                    source_rates=source_rates_list,
+                )
+                self.logger.info("IndependentOperator (construtor direto) criado com micros=None")
+            except Exception as exc:
+                self.logger.warning(
+                    "IndependentOperator falhou: %s — tentando fallback para CoupledOperator",
+                    exc
+                )
+                # Fallback para CoupledOperator se IndependentOperator não disponível
+                try:
+                    op = openmc.deplete.CoupledOperator(
+                        model=model, chain_file=str(chain), normalization_mode="source-rate"
+                    )
+                    self.logger.info("CoupledOperator criado como fallback")
+                except Exception as exc2:
+                    return self._fail(f"Operador de depleção falhou: {exc2}")
         except Exception as exc:
             self.logger.warning(
-                "IndependentOperator falhou: %s — tentando fallback para CoupledOperator",
+                "IndependentOperator.from_nuclides() falhou: %s — tentando construtor direto",
                 exc
             )
-            # Fallback para CoupledOperator se IndependentOperator não disponível
+            # Tentar construtor direto com micros=None
             try:
-                op = openmc.deplete.CoupledOperator(
-                    model=model, chain_file=str(chain), normalization_mode="source-rate"
+                op = openmc.deplete.IndependentOperator(
+                    openmc.Materials(self.materials),
+                    None,  # micros=None — será calculado internamente
+                    chain_file=str(chain),
+                    normalization_mode="source-rate",
+                    source_rates=source_rates_list,
                 )
-                self.logger.info("CoupledOperator criado como fallback")
+                self.logger.info("IndependentOperator (construtor direto) criado com micros=None")
             except Exception as exc2:
-                return self._fail(f"Operador de depleção falhou: {exc2}")
+                self.logger.warning(
+                    "IndependentOperator (direto) falhou: %s — tentando fallback para CoupledOperator",
+                    exc2
+                )
+                try:
+                    op = openmc.deplete.CoupledOperator(
+                        model=model, chain_file=str(chain), normalization_mode="source-rate"
+                    )
+                    self.logger.info("CoupledOperator criado como fallback")
+                except Exception as exc3:
+                    return self._fail(f"Operador de depleção falhou: {exc3}")
 
         dt_s = self._safe_timesteps(flux_target)
         if len(dt_s) == 0:

@@ -59,8 +59,8 @@ from config import ValidationLimits, TNLoopConfig, CoolingConfig, SimulationDefa
 try:
     from pyne_bridge import BRIDGE
 except ImportError as _e:
-    print(f"\n[MAESTRO] ERRO CRÍTICO: {_e}")
-    sys.exit(1)
+    print(f"\n[MAESTRO] AVISO: PyNE não disponível ({_e}) — módulo de resfriamento/descaimento desativado")
+    BRIDGE = None  # type: ignore
 
 _LOG_FILE = Path(_MODULE_DIR) / "maestro_v235.log"
 
