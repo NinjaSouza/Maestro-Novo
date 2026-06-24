@@ -433,9 +433,12 @@ class SimulationRunner:
             self.logger.info("MicroXS calculadas com sucesso: %d materiais processados",
                            len(micros_list))
             
-            # Criar IndependentOperator com fluxes E micros
-            # NOTA: Em OpenMC 0.15.3, IndependentOperator usa fluxes+micros diretamente
-            # Não é necessário especificar normalization_mode
+            # FIX V247: IndependentOperator SEM normalization_mode
+            # Em OpenMC 0.15.3, IndependentOperator com fluxes+micros NÃO usa
+            # normalização por energia. As taxas de reação são calculadas como:
+            #   rate = flux × sigma_micro × N_atoms
+            # O parâmetro source_rates no integrador controla apenas o fator de
+            # escala temporal (ligado/desligado), NÃO a normalização dimensional.
             op = openmc.deplete.IndependentOperator(
                 materials=openmc.Materials(depletable_materials),
                 fluxes=fluxes_list,
@@ -827,14 +830,17 @@ class SimulationRunner:
 
     def _build_integrator_flux(self, operator, dt_s: np.ndarray, flux: float):
         """
-        FIX V246: Integrador para modo FLUX — usa source_rates para controlar ativação/decaimento.
+        FIX V247: Integrador para modo FLUX — NÃO usa source_rates.
         
-        No modo flux, o IndependentOperator já recebeu fluxes+micros no construtor.
-        O integrador usa source_rates para definir quando a fonte está ligada (ativação)
-        ou desligada (decaimento puro).
+        No modo flux com IndependentOperator, as taxas de reação já estão
+        corretamente calculadas como rate = flux × sigma_micro × N_atoms.
         
-        Quando source_rate > 0: ativação com fluxo
-        Quando source_rate = 0: decaimento puro (sem ativação)
+        O parâmetro source_rates foi projetado para CoupledOperator e causa
+        normalização incorreta (divisão por energia de fissão ≈ 0) quando
+        usado com IndependentOperator para ativação.
+        
+        Para controle temporal de ativação/decaimento, o correto é criar
+        operadores separados ou usar timesteps com flux=0 para decaimento.
         """
         name_requested = (
             self.sp.get("_depletion_integrator")
@@ -859,22 +865,21 @@ class SimulationRunner:
             IntClass = getattr(openmc.deplete, "CELIIntegrator",
                                openmc.deplete.PredictorIntegrator)
         
-        # Criar source_rates: mesmo valor para todos os passos (fonte sempre ligada)
-        # Para cenários com desligamento, usar [sr1, sr2, 0.0, 0.0, ...]
-        source_rate = self.sp.get("source_rate_initial", 1e15)
-        src_rates = [source_rate] * len(dt_s)
-        
+        # FIX V247: NÃO passar source_rates para IndependentOperator
+        # source_rates causa normalização por energia de fissão (≈0 para ativação)
+        # resultando em overflow e matrizes singulares.
+        # As taxas de reação já estão corretas via flux × sigma_micro.
         self.logger.info(
-            "Integrador FLUX: %s (n_passos=%d, flux=%.4e n/cm²/s, source_rate=%.4e n/s)",
-            cls_name, len(dt_s), flux, source_rate
+            "Integrador FLUX: %s (n_passos=%d, flux=%.4e n/cm²/s) — SEM source_rates",
+            cls_name, len(dt_s), flux
         )
         
-        # Passar source_rates para controlar ativação vs decaimento
+        # Criar integrador SEM source_rates
         return IntClass(
             operator=operator,
             timesteps=dt_s,
             timestep_units="s",
-            source_rates=src_rates,
+            # source_rates omitido intencionalmente para IndependentOperator
         )
 
     # ── Timesteps ─────────────────────────────────────────────────────────────
