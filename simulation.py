@@ -426,12 +426,16 @@ class SimulationRunner:
                 chain_file=str(chain)
             )
             
-            self.logger.info("MicroXS calculadas com sucesso: %d grupos de energia",
-                           len(micros_list[0].energies) - 1 if len(micros_list) > 0 else 0)
+            # Validar que os dados foram obtidos corretamente
+            if not fluxes_list or not micros_list:
+                raise RuntimeError("get_microxs_and_flux retornou listas vazias")
+            
+            self.logger.info("MicroXS calculadas com sucesso: %d materiais processados",
+                           len(micros_list))
             
             # Criar IndependentOperator com fluxes E micros
-            # NOTA: IndependentOperator em 0.15.3 usa fluxes+micros diretamente
-            # para calcular reaction rates internamente
+            # NOTA: Em OpenMC 0.15.3, IndependentOperator usa fluxes+micros diretamente
+            # Não é necessário especificar normalization_mode
             op = openmc.deplete.IndependentOperator(
                 materials=openmc.Materials(depletable_materials),
                 fluxes=fluxes_list,
@@ -440,17 +444,12 @@ class SimulationRunner:
             )
             self.logger.info("IndependentOperator criado com fluxes=%.4e n/cm²/s", flux_target)
         except Exception as exc:
-            self.logger.warning(
-                "IndependentOperator falhou: %s — tentando fallback para CoupledOperator",
+            self.logger.error(
+                "IndependentOperator falhou: %s — NÃO usando fallback para CoupledOperator "
+                "(inadequado para simulação de ativação com fluxo prescrito)",
                 exc
             )
-            # Fallback para CoupledOperator se IndependentOperator não disponível
-            try:
-                op = openmc.deplete.CoupledOperator(
-                    model=model, chain_file=str(chain)
-                )
-            except Exception as exc2:
-                return self._fail(f"Operador de depleção falhou: {exc2}")
+            return self._fail(f"Operador de depleção falhou: {exc}")
 
         dt_s = self._safe_timesteps(flux_target)
         if len(dt_s) == 0:
